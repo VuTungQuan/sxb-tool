@@ -1,0 +1,6 @@
+# dữ liệu, không đẩy lên
+*.xlsx
+*.csv
+*.json
+ketqua/
+__pycache__/
