@@ -75,6 +75,9 @@ def duong_dan_dai(p):
 
 
 # ---------- quét kho ----------
+COT_CSV = ["STT", "Tên file", "Định dạng", "Ngày sửa", "Năm", "Kích thước (KB)", "Thư mục", "Đường dẫn"]
+
+
 def quet(thu_muc, exts, csv_path, progress=None):
     exts = {e if e.startswith(".") else "." + e for e in exts}
     goc = thu_muc
@@ -82,8 +85,9 @@ def quet(thu_muc, exts, csv_path, progress=None):
         goc = "\\\\?\\" + os.path.abspath(goc)  # đường dẫn dài >260 ký tự
     n = 0
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        f.write("sep=,\r\n")  # Excel tiếng Việt mặc định ngăn cột bằng ';' -> báo cho Excel biết file dùng ','
         w = csv.writer(f)
-        w.writerow(["ten_file", "dinh_dang", "date_modified", "path"])
+        w.writerow(COT_CSV)
         for root, _dirs, files in os.walk(goc, onerror=lambda e: None):
             for fn in files:
                 stem, ext = os.path.splitext(fn)
@@ -92,13 +96,13 @@ def quet(thu_muc, exts, csv_path, progress=None):
                     continue
                 p = os.path.join(root, fn)
                 try:
-                    m = os.path.getmtime(p)
+                    st = os.stat(p)
                 except OSError:
                     continue
-                w.writerow([stem, ext.lstrip("."),
-                            dt.datetime.fromtimestamp(m).strftime("%Y-%m-%d %H:%M:%S"),
-                            p.replace("\\\\?\\", "", 1)])
+                d = dt.datetime.fromtimestamp(st.st_mtime)
                 n += 1
+                w.writerow([n, stem, ext.lstrip(".").upper(), d.strftime("%d/%m/%Y %H:%M"), d.year,
+                            round(st.st_size / 1024), root.replace("\\\\?\\", "", 1), p.replace("\\\\?\\", "", 1)])
                 if progress and n % 1000 == 0:
                     progress(n, root)
     return n
@@ -144,12 +148,22 @@ def doc_excel(xlsx):
 
 # ---------- đối chiếu ----------
 def doc_csv(csv_path):
+    """Đọc CSV kho (định dạng mới có header tiếng Việt, hoặc cũ ten_file/dinh_dang/date_modified/path)
+    -> dict nội bộ: ten_file, dinh_dang (thường), date_modified (yyyy-mm-dd HH:MM:SS, để sort), path, key, nam."""
     with open(csv_path, encoding="utf-8-sig", newline="") as f:
+        if not f.readline().startswith("sep="):
+            f.seek(0)
         rows = list(csv.DictReader(f))
+    out = []
     for r in rows:
+        if "Tên file" in r:
+            d = dt.datetime.strptime(r["Ngày sửa"], "%d/%m/%Y %H:%M")
+            r = dict(ten_file=r["Tên file"], dinh_dang=r["Định dạng"].lower(),
+                     date_modified=d.strftime("%Y-%m-%d %H:%M:%S"), path=r["Đường dẫn"])
         r["key"] = chuan_hoa(r["ten_file"])
         r["nam"] = int(r["date_modified"][:4])
-    return rows
+        out.append(r)
+    return out
 
 
 def doi_chieu(sach, files):
@@ -577,6 +591,16 @@ def _test():
     assert ten_file_moi("Tên sách", "1/2021", "PL", "TB") == "ten_sach_0121_R_PL_T01"
     assert ten_file_moi("Tên sách", None, "Đ", None) == "ten_sach_R_D_M00"
     assert thang_qdxb("05/2023") == "05" and thang_qdxb("19/01/2007") == "01" and thang_qdxb(None) == "00"
+    # quét -> CSV đẹp -> đọc lại ra dict nội bộ
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "Sach mau.PDF"); open(p, "wb").write(b"x" * 2048)
+        t = dt.datetime(2022, 3, 5, 14, 30).timestamp(); os.utime(p, (t, t))
+        csvp = os.path.join(td, "kho.csv"); assert quet(td, [".pdf"], csvp) == 1
+        lines = open(csvp, encoding="utf-8-sig").read().splitlines()
+        assert lines[0] == "sep=," and lines[1].split(",")[:3] == ["STT", "Tên file", "Định dạng"]
+        assert lines[2].startswith("1,Sach mau,PDF,05/03/2022 14:30,2022,2,")
+        f, = doc_csv(csvp)
+        assert (f["dinh_dang"], f["date_modified"], f["nam"], f["path"]) == ("pdf", "2022-03-05 14:30:00", 2022, p)
     sach = [dict(nam=2025, dong=4, tt=1, ten="Dạ thưa, xứ Huế bây chừ", lan=None, bbt="QT", qdxb="1/2025"),
             dict(nam=2025, dong=5, tt=2, ten="Luật đầu tư", lan="TB", bbt="PL", qdxb="2/2025"),
             dict(nam=2025, dong=6, tt=3, ten="Không có", lan=None, bbt="PL", qdxb=None)]
