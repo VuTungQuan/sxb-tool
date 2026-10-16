@@ -4,3 +4,7 @@
 *.json
 ketqua/
 __pycache__/
+# build exe
+build/
+dist/
+*.spec
