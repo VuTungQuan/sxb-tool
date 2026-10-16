@@ -84,9 +84,10 @@ def quet(thu_muc, exts, csv_path, progress=None):
     if os.name == "nt" and not goc.startswith("\\\\?\\"):
         goc = "\\\\?\\" + os.path.abspath(goc)  # đường dẫn dài >260 ký tự
     n = 0
-    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-        f.write("sep=,\r\n")  # Excel tiếng Việt mặc định ngăn cột bằng ';' -> báo cho Excel biết file dùng ','
-        w = csv.writer(f)
+    # UTF-16 + tab: Excel mở đúng font và đúng cột trên mọi locale (en-US ngăn cột ',', vi-VN ngăn ';').
+    # UTF-8 + "sep=," thì Excel bỏ BOM và đọc sai font tiếng Việt.
+    with open(csv_path, "w", newline="", encoding="utf-16") as f:
+        w = csv.writer(f, delimiter="\t")
         w.writerow(COT_CSV)
         for root, _dirs, files in os.walk(goc, onerror=lambda e: None):
             for fn in files:
@@ -150,10 +151,12 @@ def doc_excel(xlsx):
 def doc_csv(csv_path):
     """Đọc CSV kho (định dạng mới có header tiếng Việt, hoặc cũ ten_file/dinh_dang/date_modified/path)
     -> dict nội bộ: ten_file, dinh_dang (thường), date_modified (yyyy-mm-dd HH:MM:SS, để sort), path, key, nam."""
-    with open(csv_path, encoding="utf-8-sig", newline="") as f:
-        if not f.readline().startswith("sep="):
+    with open(csv_path, "rb") as f:
+        utf16 = f.read(2) == b"\xff\xfe"
+    with open(csv_path, encoding="utf-16" if utf16 else "utf-8-sig", newline="") as f:
+        if not utf16 and not f.readline().startswith("sep="):
             f.seek(0)
-        rows = list(csv.DictReader(f))
+        rows = list(csv.DictReader(f, delimiter="\t" if utf16 else ","))
     out = []
     for r in rows:
         if "Tên file" in r:
@@ -596,11 +599,14 @@ def _test():
         p = os.path.join(td, "Sach mau.PDF"); open(p, "wb").write(b"x" * 2048)
         t = dt.datetime(2022, 3, 5, 14, 30).timestamp(); os.utime(p, (t, t))
         csvp = os.path.join(td, "kho.csv"); assert quet(td, [".pdf"], csvp) == 1
-        lines = open(csvp, encoding="utf-8-sig").read().splitlines()
-        assert lines[0] == "sep=," and lines[1].split(",")[:3] == ["STT", "Tên file", "Định dạng"]
-        assert lines[2].startswith("1,Sach mau,PDF,05/03/2022 14:30,2022,2,")
+        lines = open(csvp, encoding="utf-16").read().splitlines()
+        assert lines[0].split("\t")[:3] == ["STT", "Tên file", "Định dạng"]
+        assert lines[1].startswith("1\tSach mau\tPDF\t05/03/2022 14:30\t2022\t2\t")
         f, = doc_csv(csvp)
         assert (f["dinh_dang"], f["date_modified"], f["nam"], f["path"]) == ("pdf", "2022-03-05 14:30:00", 2022, p)
+        cu = os.path.join(td, "cu.csv")  # định dạng cũ utf-8 phẩy vẫn đọc được
+        open(cu, "w", encoding="utf-8-sig", newline="").write("ten_file,dinh_dang,date_modified,path\r\nx,docx,2020-01-02 03:04:05,x.docx\r\n")
+        assert doc_csv(cu)[0]["nam"] == 2020
     sach = [dict(nam=2025, dong=4, tt=1, ten="Dạ thưa, xứ Huế bây chừ", lan=None, bbt="QT", qdxb="1/2025"),
             dict(nam=2025, dong=5, tt=2, ten="Luật đầu tư", lan="TB", bbt="PL", qdxb="2/2025"),
             dict(nam=2025, dong=6, tt=3, ten="Không có", lan=None, bbt="PL", qdxb=None)]
