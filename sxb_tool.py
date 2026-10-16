@@ -1,4 +1,4 @@
-"""Tool SXB: quét kho file -> CSV, đối chiếu với 'Tong hop SXB 2006-2025.xlsx', phân loại,
+"""Tool SXB: quét kho file -> Excel, đối chiếu với 'Tong hop SXB 2006-2025.xlsx', phân loại,
 kiểm tra nội dung file (năm trang cuối, lời nói đầu), đổi tên & lưu theo Năm/thang MM.
 
 Chạy:  python -X utf8 sxb_tool.py            (giao diện)
@@ -75,37 +75,58 @@ def duong_dan_dai(p):
 
 
 # ---------- quét kho ----------
-COT_CSV = ["STT", "Tên file", "Định dạng", "Ngày sửa", "Năm", "Kích thước (KB)", "Thư mục", "Đường dẫn"]
+COT_KHO = ["STT", "Tên file", "Định dạng", "Ngày sửa", "Năm", "Kích thước (KB)", "Đường dẫn"]
+RONG_KHO = [6, 70, 10, 17, 7, 14, 100]
+MAX_DONG = 1_048_575  # ponytail: Excel giới hạn 1.048.576 dòng/sheet -> quá thì mở sheet "Kho 2", "Kho 3"...
 
 
-def quet(thu_muc, exts, csv_path, progress=None):
+def quet(thu_muc, exts, xlsx_path, progress=None):
+    """Quét kho -> file .xlsx có định dạng (header đậm, cố định dòng 1, độ rộng cột, wrap text)."""
+    from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
+    from openpyxl.styles import Alignment, Font
     exts = {e if e.startswith(".") else "." + e for e in exts}
     goc = thu_muc
     if os.name == "nt" and not goc.startswith("\\\\?\\"):
         goc = "\\\\?\\" + os.path.abspath(goc)  # đường dẫn dài >260 ký tự
-    n = 0
-    # UTF-16 + tab: Excel mở đúng font và đúng cột trên mọi locale (en-US ngăn cột ',', vi-VN ngăn ';').
-    # UTF-8 + "sep=," thì Excel bỏ BOM và đọc sai font tiếng Việt.
-    with open(csv_path, "w", newline="", encoding="utf-16") as f:
-        w = csv.writer(f, delimiter="\t")
-        w.writerow(COT_CSV)
-        for root, _dirs, files in os.walk(goc, onerror=lambda e: None):
-            for fn in files:
-                stem, ext = os.path.splitext(fn)
-                ext = ext.lower()
-                if exts and ext not in exts:
-                    continue
-                p = os.path.join(root, fn)
-                try:
-                    st = os.stat(p)
-                except OSError:
-                    continue
-                d = dt.datetime.fromtimestamp(st.st_mtime)
-                n += 1
-                w.writerow([n, stem, ext.lstrip(".").upper(), d.strftime("%d/%m/%Y %H:%M"), d.year,
-                            round(st.st_size / 1024), root.replace("\\\\?\\", "", 1), p.replace("\\\\?\\", "", 1)])
-                if progress and n % 1000 == 0:
-                    progress(n, root)
+    wb = Workbook(write_only=True)
+    wrap = Alignment(wrap_text=True, vertical="top")
+
+    def o(ws, v, **kw):
+        c = WriteOnlyCell(ws, value=v)
+        for k, x in kw.items(): setattr(c, k, x)
+        return c
+
+    def sheet_moi():
+        ws = wb.create_sheet(f"Kho {len(wb.sheetnames) + 1}" if wb.sheetnames else "Kho")
+        for cot, r in zip("ABCDEFG", RONG_KHO):
+            ws.column_dimensions[cot].width = r
+        ws.freeze_panes = "A2"
+        ws.append([o(ws, h, font=Font(bold=True), alignment=Alignment(horizontal="center")) for h in COT_KHO])
+        return ws
+
+    ws, n = sheet_moi(), 0
+    for root, _dirs, files in os.walk(goc, onerror=lambda e: None):
+        for fn in files:
+            stem, ext = os.path.splitext(fn)
+            ext = ext.lower()
+            if exts and ext not in exts:
+                continue
+            p = os.path.join(root, fn)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            d = dt.datetime.fromtimestamp(st.st_mtime)
+            n += 1
+            if n % MAX_DONG == 1 and n > 1:
+                ws = sheet_moi()
+            ws.append([n, o(ws, stem, alignment=wrap), ext.lstrip(".").upper(),
+                       o(ws, d.replace(second=0, microsecond=0), number_format="dd/mm/yyyy hh:mm"),
+                       d.year, round(st.st_size / 1024), o(ws, p.replace("\\\\?\\", "", 1), alignment=wrap)])
+            if progress and n % 1000 == 0:
+                progress(n, root)
+    wb.save(xlsx_path)
     return n
 
 
@@ -148,25 +169,36 @@ def doc_excel(xlsx):
 
 
 # ---------- đối chiếu ----------
-def doc_csv(csv_path):
-    """Đọc CSV kho (định dạng mới có header tiếng Việt, hoặc cũ ten_file/dinh_dang/date_modified/path)
+def doc_kho(path):
+    """Đọc file kho: .xlsx do quet() xuất, hoặc .csv cũ (utf-8 phẩy / utf-16 tab, header tiếng Việt hoặc máy)
     -> dict nội bộ: ten_file, dinh_dang (thường), date_modified (yyyy-mm-dd HH:MM:SS, để sort), path, key, nam."""
-    with open(csv_path, "rb") as f:
-        utf16 = f.read(2) == b"\xff\xfe"
-    with open(csv_path, encoding="utf-16" if utf16 else "utf-8-sig", newline="") as f:
-        if not utf16 and not f.readline().startswith("sep="):
-            f.seek(0)
-        rows = list(csv.DictReader(f, delimiter="\t" if utf16 else ","))
-    out = []
+    rows = []
+    if path.lower().endswith(".xlsx"):
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True)
+        for ws in wb.worksheets:
+            it = ws.iter_rows(values_only=True); next(it, None)
+            for r in it:
+                if r and r[1] is not None:
+                    rows.append(dict(ten_file=str(r[1]), dinh_dang=str(r[2]).lower(),
+                                     date_modified=r[3].strftime("%Y-%m-%d %H:%M:%S"), path=str(r[6])))
+        wb.close()
+    else:
+        with open(path, "rb") as f:
+            utf16 = f.read(2) == b"\xff\xfe"
+        with open(path, encoding="utf-16" if utf16 else "utf-8-sig", newline="") as f:
+            if not utf16 and not f.readline().startswith("sep="):
+                f.seek(0)
+            for r in csv.DictReader(f, delimiter="\t" if utf16 else ","):
+                if "Tên file" in r:
+                    d = dt.datetime.strptime(r["Ngày sửa"], "%d/%m/%Y %H:%M")
+                    r = dict(ten_file=r["Tên file"], dinh_dang=r["Định dạng"].lower(),
+                             date_modified=d.strftime("%Y-%m-%d %H:%M:%S"), path=r["Đường dẫn"])
+                rows.append(r)
     for r in rows:
-        if "Tên file" in r:
-            d = dt.datetime.strptime(r["Ngày sửa"], "%d/%m/%Y %H:%M")
-            r = dict(ten_file=r["Tên file"], dinh_dang=r["Định dạng"].lower(),
-                     date_modified=d.strftime("%Y-%m-%d %H:%M:%S"), path=r["Đường dẫn"])
         r["key"] = chuan_hoa(r["ten_file"])
         r["nam"] = int(r["date_modified"][:4])
-        out.append(r)
-    return out
+    return rows
 
 
 def doi_chieu(sach, files):
@@ -437,7 +469,7 @@ def gui():
     root.geometry("800x520")
     nb = ttk.Notebook(root); nb.pack(fill="both", expand=True, padx=8, pady=8)
     chon_xlsx = lambda: filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")])
-    chon_csv = lambda: filedialog.askopenfilename(filetypes=[("CSV", "*.csv")])
+    chon_csv = lambda: filedialog.askopenfilename(filetypes=[("File kho", "*.xlsx *.csv")])
 
     def hang(parent, r, nhan, var, chon=None):
         ttk.Label(parent, text=nhan, width=20).grid(row=r, column=0, sticky="w", pady=4)
@@ -460,17 +492,17 @@ def gui():
         return lambda s: root.after(0, lambda: (txt.insert("end", s + "\n"), txt.see("end")))
 
     # --- tab 1: quét ---
-    t1 = ttk.Frame(nb, padding=10); nb.add(t1, text="1. Quét kho → CSV")
+    t1 = ttk.Frame(nb, padding=10); nb.add(t1, text="1. Quét kho → Excel")
     v_tm, v_ext, v_csv = tk.StringVar(), tk.StringVar(value=EXT_MAC_DINH), tk.StringVar()
     hang(t1, 0, "Thư mục kho", v_tm, filedialog.askdirectory)
     hang(t1, 1, "Định dạng (cách)", v_ext)
-    hang(t1, 2, "File CSV xuất", v_csv,
-         lambda: filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")]))
+    hang(t1, 2, "File Excel xuất", v_csv,
+         lambda: filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")]))
     tt1 = ttk.Label(t1, text="", wraplength=700); tt1.grid(row=4, column=0, columnspan=3, sticky="w", pady=8)
 
     def quet_gui():
         if not os.path.isdir(v_tm.get()): raise ValueError("Chưa chọn thư mục kho")
-        if not v_csv.get(): v_csv.set(os.path.join(os.getcwd(), f"kho_{dt.datetime.now():%Y%m%d_%H%M}.csv"))
+        if not v_csv.get(): v_csv.set(os.path.join(os.getcwd(), f"kho_{dt.datetime.now():%Y%m%d_%H%M}.xlsx"))
         def prog(n, root_dir): root.after(0, lambda: tt1.config(text=f"Đã quét {n} file... {root_dir[-80:]}"))
         n = quet(v_tm.get(), v_ext.get().split(), v_csv.get(), prog)
         root.after(0, lambda: tt1.config(text=f"Xong: {n} file → {v_csv.get()}"))
@@ -480,17 +512,17 @@ def gui():
     t2 = ttk.Frame(nb, padding=10); nb.add(t2, text="2. Đối chiếu Excel")
     v_xl, v_csv2, v_ra = tk.StringVar(), tk.StringVar(), tk.StringVar(value=os.getcwd())
     hang(t2, 0, "File Excel tổng hợp", v_xl, chon_xlsx)
-    hang(t2, 1, "File CSV kho", v_csv2, lambda: chon_csv() or v_csv.get())
+    hang(t2, 1, "File kho (xlsx)", v_csv2, lambda: chon_csv() or v_csv.get())
     hang(t2, 2, "Thư mục kết quả", v_ra, filedialog.askdirectory)
     tt2 = tk.Text(t2, height=9, wrap="word"); tt2.grid(row=4, column=0, columnspan=3, sticky="we", pady=8)
 
     def doi_chieu_gui():
         csvp = v_csv2.get() or v_csv.get()
         if not os.path.isfile(v_xl.get()): raise ValueError("Chưa chọn file Excel")
-        if not os.path.isfile(csvp): raise ValueError("Chưa chọn file CSV kho")
+        if not os.path.isfile(csvp): raise ValueError("Chưa chọn file kho")
         log = logger(tt2)
         log("Đọc Excel..."); sach = doc_excel(v_xl.get()); log(f"  {len(sach)} đầu sách")
-        log("Đọc CSV..."); files = doc_csv(csvp); log(f"  {len(files)} file")
+        log("Đọc file kho..."); files = doc_kho(csvp); log(f"  {len(files)} file")
         kq = doi_chieu(sach, files)
         dem = defaultdict(int)
         for r in kq: dem[r["tinh_trang"]] += 1
@@ -507,7 +539,7 @@ def gui():
     v_lech, v_ktt = tk.BooleanVar(value=True), tk.BooleanVar(value=True)
     hang(t3, 0, "File doi_chieu_*.xlsx", v_dc, chon_xlsx)
     hang(t3, 1, "File Excel tổng hợp", v_xl3, chon_xlsx)
-    hang(t3, 2, "File CSV kho", v_csv3, chon_csv)
+    hang(t3, 2, "File kho (xlsx)", v_csv3, chon_csv)
     hang(t3, 3, "Thư mục kết quả", v_ra3, filedialog.askdirectory)
     ttk.Checkbutton(t3, text="Xử lý LỆCH NĂM (đọc năm ở trang cuối các file đã tìm được)", variable=v_lech)\
         .grid(row=4, column=0, columnspan=3, sticky="w")
@@ -520,10 +552,10 @@ def gui():
 
     def kiem_tra_gui():
         xl, csvp, ra = v_xl3.get() or v_xl.get(), v_csv3.get() or v_csv2.get() or v_csv.get(), v_ra3.get() or v_ra.get()
-        for p, m in ((v_dc.get(), "file doi_chieu"), (xl, "file Excel tổng hợp"), (csvp, "file CSV kho")):
+        for p, m in ((v_dc.get(), "file doi_chieu"), (xl, "file Excel tổng hợp"), (csvp, "file kho")):
             if not os.path.isfile(p): raise ValueError(f"Chưa chọn {m}")
         log = logger(tt3)
-        kq = doc_doi_chieu(v_dc.get()); files = doc_csv(csvp)
+        kq = doc_doi_chieu(v_dc.get()); files = doc_kho(csvp)
         cache_p = csvp + ".cache.json"; cache = doc_cache(cache_p)
         log(f"{len(kq)} dòng, {len(files)} file kho, cache {len(cache)} file")
         try:
@@ -594,19 +626,20 @@ def _test():
     assert ten_file_moi("Tên sách", "1/2021", "PL", "TB") == "ten_sach_0121_R_PL_T01"
     assert ten_file_moi("Tên sách", None, "Đ", None) == "ten_sach_R_D_M00"
     assert thang_qdxb("05/2023") == "05" and thang_qdxb("19/01/2007") == "01" and thang_qdxb(None) == "00"
-    # quét -> CSV đẹp -> đọc lại ra dict nội bộ
+    # quét -> xlsx có định dạng -> đọc lại ra dict nội bộ
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "Sach mau.PDF"); open(p, "wb").write(b"x" * 2048)
         t = dt.datetime(2022, 3, 5, 14, 30).timestamp(); os.utime(p, (t, t))
-        csvp = os.path.join(td, "kho.csv"); assert quet(td, [".pdf"], csvp) == 1
-        lines = open(csvp, encoding="utf-16").read().splitlines()
-        assert lines[0].split("\t")[:3] == ["STT", "Tên file", "Định dạng"]
-        assert lines[1].startswith("1\tSach mau\tPDF\t05/03/2022 14:30\t2022\t2\t")
-        f, = doc_csv(csvp)
+        kho = os.path.join(td, "kho.xlsx"); assert quet(td, [".pdf"], kho) == 1
+        ws = openpyxl.load_workbook(kho)["Kho"]
+        assert [c.value for c in ws[1]] == COT_KHO and ws["A1"].font.bold and ws.freeze_panes == "A2"
+        assert ws.column_dimensions["B"].width == 70 and ws["B2"].alignment.wrap_text and ws["G2"].alignment.wrap_text
+        assert [c.value for c in ws[2]] == [1, "Sach mau", "PDF", dt.datetime(2022, 3, 5, 14, 30), 2022, 2, p]
+        f, = doc_kho(kho)
         assert (f["dinh_dang"], f["date_modified"], f["nam"], f["path"]) == ("pdf", "2022-03-05 14:30:00", 2022, p)
-        cu = os.path.join(td, "cu.csv")  # định dạng cũ utf-8 phẩy vẫn đọc được
+        cu = os.path.join(td, "cu.csv")  # csv cũ utf-8 phẩy vẫn đọc được
         open(cu, "w", encoding="utf-8-sig", newline="").write("ten_file,dinh_dang,date_modified,path\r\nx,docx,2020-01-02 03:04:05,x.docx\r\n")
-        assert doc_csv(cu)[0]["nam"] == 2020
+        assert doc_kho(cu)[0]["nam"] == 2020
     sach = [dict(nam=2025, dong=4, tt=1, ten="Dạ thưa, xứ Huế bây chừ", lan=None, bbt="QT", qdxb="1/2025"),
             dict(nam=2025, dong=5, tt=2, ten="Luật đầu tư", lan="TB", bbt="PL", qdxb="2/2025"),
             dict(nam=2025, dong=6, tt=3, ten="Không có", lan=None, bbt="PL", qdxb=None)]

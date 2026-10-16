@@ -13,7 +13,7 @@ Chạy `build.bat` (cần `pip install pyinstaller`) → `dist\SXBTool.exe`, 1 f
 Lần đầu mở mất vài giây vì exe tự giải nén. Nếu Windows Defender cảnh báo thì chọn "Run anyway" (exe PyInstaller chưa ký số).
 
 ## Quy trình
-1. **Quét kho → CSV**: tên file, định dạng, date modified, path.
+1. **Quét kho → Excel**: STT, tên file, định dạng, ngày sửa, năm, kích thước, đường dẫn. Header đậm, cố định dòng 1, wrap text. Quá 1.048.575 dòng thì tự tách sheet Kho 2, Kho 3.
 2. **Đối chiếu Excel**: khớp tên sách (bỏ dấu) với tên file, lọc theo năm Date Modified → `KHỚP` / `LỆCH NĂM` / `KHÔNG TÌM THẤY`. Xuất `doi_chieu_*.xlsx` (2 sheet) và bản Excel gốc có thêm cột tình trạng.
 3. **Kiểm tra nội dung**: mở PDF/DOCX đọc năm ở trang cuối, dò "Lời nói đầu" trong 8 trang đầu. Text trích được cache.
 4. **Đổi tên & lưu**: copy/move file sang `Năm/thang MM` theo tên mới `ten_sach_mmyy_R_BBT_T01`.
