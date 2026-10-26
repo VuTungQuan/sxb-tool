@@ -4,10 +4,14 @@ kiểm tra nội dung file (năm trang cuối, lời nói đầu), đổi tên &
 Chạy:  python -X utf8 sxb_tool.py            (giao diện)
        python -X utf8 sxb_tool.py --test     (tự kiểm tra)
 """
-import csv, glob, html, json, os, re, shutil, sqlite3, subprocess, sys, tempfile, threading, time, unicodedata, zipfile, datetime as dt
+import csv, faulthandler, functools, glob, html, json, os, re, shutil, sqlite3, subprocess, sys, tempfile, threading, time, traceback, unicodedata, zipfile, datetime as dt
 from collections import Counter, defaultdict
 
-EXT_MAC_DINH = ".doc .docx .pdf .jpg .jpeg"
+EXT_MAC_DINH = ".doc .docx .pdf .jpg .jpeg .png .tif .tiff .ai .psd .eps"
+XL_TONG_HOP = "Tong hop SXB 2006-2025_chuan.xlsx"  # Excel tổng hợp mặc định (tìm cạnh exe hoặc thư mục cha)
+XL_MA_BBT = "BBT_distinct.xlsx"  # mã BBT quy định: cột B = BBT (cột J Excel tổng hợp), cột F = mã dùng trong tên file
+MA_BBT = {}  # {BBT nguyên gốc ('(trống)' = ô trống): mã quy định}, nạp lại mỗi lần đối chiếu
+DUOI_BIA = {"ai", "jpg", "jpeg", "png", "tif", "tiff", "psd", "eps", "gif", "bmp"}  # ảnh / file thiết kế = bìa
 WORD = {"doc", "docx"}
 DOC_DUOC = {"pdf", "docx"}  # định dạng trích được text (.doc bỏ qua)
 BIA = re.compile(r"(?:^| )(bia|to che|tr ?2 4)(?= |$)")  # file bìa / tờ che / trang 2-4 (đã chuan_hoa)
@@ -81,14 +85,39 @@ def ma_lan_xb(v):
 DAI_TEN = 90  # độ dài tối đa phần tên sách: thư mục sách + tên file (đều = tên mới) giữ đường dẫn dưới 260 ký tự
 
 
+CHU_THICH = re.compile(r" (?:sach (?:chuyen khao|tham khao)|xuat ban lan thu|tai ban|nguoi dich|bien dich|dich gia)\b.*$")
+
+
+def loi_ten(ten):
+    """Khoá để khớp tên sách: bỏ phần chú thích sau tên ('Sách chuyên khảo/tham khảo', 'Xuất bản lần thứ...', 'Tái bản...',
+    'Người dịch / Biên dịch') vì tên file, tên thư mục thường không ghi. Giữ chú thích ngôn ngữ ('Tiếng Lào': sách khác)."""
+    k = chuan_hoa(ten)
+    g = CHU_THICH.sub("", k)
+    return g if len(g.split()) >= 2 else k
+
+
 def ten_file_moi(ten_sach, qdxb, bbt, lan_xb):
     """Tên mới 'ten_sach_0121_R_PL_T01'; phần tên sách dài quá DAI_TEN ký tự thì cắt ở ranh giới từ."""
     ten = "_".join(chuan_hoa(ten_sach).split())
     parts = [ten if len(ten) <= DAI_TEN else ten[:DAI_TEN + 1].rsplit("_", 1)[0]]
     if ma_ngay(qdxb):
         parts.append(ma_ngay(qdxb))
-    parts += ["R", chuan_hoa(bbt or "").upper().replace(" ", "") or "XX", ma_lan_xb(lan_xb)]
+    ma = MA_BBT.get(str(bbt).strip() if bbt not in (None, "") else "(trống)")
+    parts += ["R", ma or chuan_hoa(bbt or "").upper().replace(" ", "") or "XX", ma_lan_xb(lan_xb)]
     return "_".join(parts)
+
+
+def doc_ma_bbt(path):
+    """BBT_distinct.xlsx -> {BBT nguyên gốc: mã quy định (chỉ chữ in hoa không dấu + số)}; dòng chưa điền mã thì bỏ qua."""
+    import openpyxl
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        rows = [r for r in wb.worksheets[0].iter_rows(min_row=2, values_only=True) if len(r) > 5 and r[1] is not None]
+        # mã gõ dạng số (Excel bỏ số 0 đầu: 3 thay vì '03') -> 2 chữ số
+        ma = lambda v: "" if v is None else f"{v:02d}" if isinstance(v, int) else re.sub(r"[^A-Z0-9]", "", chuan_hoa(str(v)).upper())
+        return {k: v for k, v in ((str(r[1]).strip(), ma(r[5])) for r in rows) if v}
+    finally:
+        wb.close()
 
 
 def thang_qdxb(v):
@@ -112,19 +141,90 @@ RONG_KHO = [6, 70, 10, 17, 7, 14, 100]
 MAX_DONG = 1_048_575  # ponytail: Excel giới hạn 1.048.576 dòng/sheet -> quá thì mở sheet "Kho 2", "Kho 3"...
 
 
-def quet(thu_muc, exts, xlsx_path, progress=None, bao_cao=None):
+def _doc_nhat_ky(nhat_ky):
+    """Đọc nhật ký quét: lặp (loại, các cột) của các thư mục đã xong; khối cuối chưa có dòng 'D' (đang quét dở thì tool tắt)
+    bị bỏ và cắt khỏi file. -> danh sách dòng hợp lệ."""
+    hop_le, cho, cuoi = [], [], 0
+    with open(nhat_ky, "rb") as f:
+        while True:
+            dong = f.readline()
+            if not dong:
+                break
+            if not dong.endswith(b"\n"):  # dòng ghi dở
+                break
+            try:
+                row = next(csv.reader([dong.decode("utf-8")]))
+            except (UnicodeDecodeError, csv.Error, StopIteration):
+                break
+            cho.append(row)
+            if row and row[0] in ("#", "D"):
+                hop_le += cho; cho = []; cuoi = f.tell()
+    os.truncate(nhat_ky, cuoi)
+    return hop_le
+
+
+def quet(thu_muc, exts, xlsx_path, progress=None, bao_cao=None, nhat_ky=None):
     """Quét kho -> file .xlsx có định dạng (header đậm, cố định dòng 1, độ rộng cột, wrap text).
-    bao_cao (dict) nhận: 'loi' = [thư mục/file không đọc được], 'dinh_dang' = Counter số file theo định dạng."""
+    Ghi dần vào nhật ký quét (CSV; mỗi thư mục quét xong là ghi xuống đĩa). Tool tắt đột ngột hoặc bấm Dừng giữa chừng:
+    gọi lại với cùng nhat_ky thì bỏ qua các thư mục đã quét, làm tiếp. Xong thì chuyển sang .xlsx và xoá nhật ký.
+    bao_cao (dict) nhận: 'loi' = [thư mục/file không đọc được], 'dinh_dang' = Counter, 'tiep' = số file lấy lại từ lần dở."""
     bao_cao = {} if bao_cao is None else bao_cao
     loi, dem = bao_cao.setdefault("loi", []), bao_cao.setdefault("dinh_dang", Counter())
     bo = lambda x: str(x or "").replace("\\\\?\\", "", 1)
-    from openpyxl import Workbook
-    from openpyxl.cell import WriteOnlyCell
-    from openpyxl.styles import Alignment, Font
+    nhat_ky = nhat_ky or xlsx_path + ".dang_quet.csv"
     exts = {e if e.startswith(".") else "." + e for e in exts}
     goc = thu_muc
     if os.name == "nt" and not goc.startswith("\\\\?\\"):
         goc = "\\\\?\\" + os.path.abspath(goc)  # đường dẫn dài >260 ký tự
+    dau = ["#", os.path.abspath(thu_muc), " ".join(sorted(exts))]
+    da_xong, n = set(), 0
+    if os.path.exists(nhat_ky):
+        cu = _doc_nhat_ky(nhat_ky)
+        if cu and cu[0] != dau:
+            raise ValueError(f"Nhật ký quét dở là của thư mục/định dạng khác: {cu[0][1:]}")
+        for row in cu[1:]:
+            if row[0] == "F" and len(row) == 6:
+                n += 1; dem[row[2].upper()] += 1
+            elif row[0] == "D" and len(row) == 2:
+                da_xong.add(row[1])
+            elif row[0] == "L" and len(row) == 2:
+                loi.append(row[1])
+        if not cu:
+            os.remove(nhat_ky)
+    bao_cao["tiep"] = n
+    moi = not os.path.exists(nhat_ky)
+    with open(nhat_ky, "a", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        if moi:
+            w.writerow(dau); f.flush()
+        def loi_walk(e):  # thư mục không đọc được (không có quyền, đường dẫn hỏng...)
+            loi.append(f"{bo(e.filename)}: {e.strerror}"); w.writerow(["L", loi[-1]])
+        for root, _dirs, files in os.walk(goc, onerror=loi_walk):
+            if bo(root) in da_xong:
+                continue
+            khoi = []  # cả thư mục ghi một lần kèm dòng 'D': tắt giữa chừng thì lần sau quét lại thư mục này từ đầu
+            for fn in files:
+                _dung()  # dừng: phần đã quét giữ trong nhật ký, chạy lại sẽ quét tiếp
+                stem, ext = os.path.splitext(fn)
+                ext = ext.lower()
+                if exts and ext not in exts:
+                    continue
+                p = os.path.join(root, fn)
+                try:
+                    st = os.stat(p)
+                except OSError as e:
+                    khoi.append(["L", f"{bo(p)}: {e.strerror}"]); loi.append(khoi[-1][1])
+                    continue
+                dem[ext.lstrip(".").upper()] += 1; n += 1
+                khoi.append(["F", stem, ext.lstrip(".").upper(), str(st.st_mtime), str(st.st_size), bo(p)])
+                if progress and n % 1000 == 0:
+                    progress(n, root)
+            w.writerows(khoi + [["D", bo(root)]]); f.flush()
+
+    # nhật ký -> Excel
+    from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
+    from openpyxl.styles import Alignment, Font
     wb = Workbook(write_only=True)
     wrap = Alignment(wrap_text=True, vertical="top")
 
@@ -142,36 +242,19 @@ def quet(thu_muc, exts, xlsx_path, progress=None, bao_cao=None):
         return ws
 
     ws, n = sheet_moi(), 0
-    for root, _dirs, files in os.walk(goc, onerror=lambda e: loi.append(f"{bo(e.filename)}: {e.strerror}")):
-        for fn in files:
-            if DUNG.is_set():  # dừng: không lưu file kho dở, xoá ngay file tạm của openpyxl (quét lớn thì rất nặng)
-                for w in wb.worksheets:
-                    try:
-                        w.close(); w._writer.cleanup()
-                    except Exception:
-                        pass
-                _dung()
-            stem, ext = os.path.splitext(fn)
-            ext = ext.lower()
-            if exts and ext not in exts:
-                continue
-            p = os.path.join(root, fn)
-            try:
-                st = os.stat(p)
-            except OSError as e:
-                loi.append(f"{bo(p)}: {e.strerror}")
-                continue
-            dem[ext.lstrip(".").upper()] += 1
-            d = dt.datetime.fromtimestamp(st.st_mtime)
-            n += 1
-            if n % MAX_DONG == 1 and n > 1:
-                ws = sheet_moi()
-            ws.append([n, o(ws, stem, alignment=wrap), ext.lstrip(".").upper(),
-                       o(ws, d.replace(second=0, microsecond=0), number_format="dd/mm/yyyy hh:mm"),
-                       d.year, round(st.st_size / 1024), o(ws, p.replace("\\\\?\\", "", 1), alignment=wrap)])
-            if progress and n % 1000 == 0:
-                progress(n, root)
+    for row in _doc_nhat_ky(nhat_ky):
+        if row[0] != "F" or len(row) != 6:
+            continue
+        _, stem, ext, mtime, size, path = row
+        d = dt.datetime.fromtimestamp(float(mtime))
+        n += 1
+        if n % MAX_DONG == 1 and n > 1:
+            ws = sheet_moi()
+        ws.append([n, o(ws, stem, alignment=wrap), ext,
+                   o(ws, d.replace(second=0, microsecond=0), number_format="dd/mm/yyyy hh:mm"),
+                   d.year, round(int(size) / 1024), o(ws, path, alignment=wrap)])
     wb.save(xlsx_path)
+    os.remove(nhat_ky)
     return n
 
 
@@ -264,25 +347,78 @@ def key_thu_muc(thu_muc):
 
 
 def la_bia(path, key_sach=""):
-    """File bìa / tờ che / trang 2-4 — trừ khi chính tên sách có từ đó."""
+    """File bìa / tờ che / trang 2-4 — trừ khi chính tên sách có từ đó. Không xét tên thư mục: kho có thư mục 'Bia'
+    chứa cả file ruột (…R06M00.pdf 19 trang)."""
     return bool(BIA.search(chuan_hoa(os.path.splitext(os.path.basename(path))[0]))) and not BIA.search(key_sach)
 
 
+@functools.lru_cache(maxsize=200000)
+def so_trang_pdf(path):
+    """Số trang PDF (None nếu không mở được)."""
+    try:
+        import fitz
+        with fitz.open(duong_dan_dai(path)) as d:
+            return len(d)
+    except Exception:
+        return None
+
+
+@functools.lru_cache(maxsize=200000)
+def pdf_mong(path):
+    """PDF bìa, không phải ruột sách: 1-2 trang (bìa 1, bìa 4, tờ che, trang 2-4), hoặc ≤ 8 trang mà trang đầu
+    nằm ngang (trải bìa 1 + gáy + bìa 4, các trang sau là tai gập)."""
+    if not path.lower().endswith(".pdf"):
+        return False
+    try:
+        import fitz
+        with fitz.open(duong_dan_dai(path)) as d:
+            n, r = len(d), (d[0].rect if len(d) else None)
+    except Exception:
+        return False
+    return 0 < n <= 2 or (n <= 8 and r.width > 1.3 * r.height)
+
+
 def chon_file(ds, key_sach=""):
-    """ds: [(date_modified, path)] -> (word, pdf, số file bìa bỏ qua). Mới nhất; bằng nhau lấy file lớn nhất."""
+    """ds: [(date_modified, path)] -> (word, pdf, số file bìa bỏ qua). Mới nhất; cùng ngày sửa thì PDF nhiều trang hơn,
+    rồi file lớn hơn. Bỏ file bìa (tên 'Bìa / Tờ che / Tr 2-4') và PDF 1-2 trang (chỉ đếm trang PDF của nhóm đang xét)."""
     def kt(p):
         try: return os.path.getsize(duong_dan_dai(p))
         except OSError: return 0
     chinh = [x for x in ds if not la_bia(x[1], key_sach)]
     w = [x for x in chinh if x[1].rsplit(".", 1)[-1].lower() in WORD]
     p = [x for x in chinh if x[1].lower().endswith(".pdf")]
-    best = lambda xs: max(xs, key=lambda x: (x[0], kt(x[1])))[1] if xs else ""
+    def best(xs):
+        for ngay in sorted({x[0] for x in xs}, reverse=True):
+            cung = [x for x in xs if x[0] == ngay and not pdf_mong(x[1])]
+            if cung:
+                trang = lambda x: (so_trang_pdf(x[1]) or 0) if x[1].lower().endswith(".pdf") else 0
+                return max(cung, key=lambda x: (trang(x), kt(x[1])))[1]
+        return ""
     return best(w), best(p), len(ds) - len(chinh)
+
+
+def ds_bia(r):
+    """File bìa của một dòng KHỚP: trong thư mục của file ruột đã chọn (sách chỉ có bìa: thư mục của file mới nhất),
+    là ảnh / file thiết kế (.ai, .jpg, .png...), PDF bìa (pdf_mong) hoặc file bìa theo tên (la_bia, kể cả ở thư mục con 'Bia')."""
+    ds = _dong_file(r["cac_file"])
+    tm = {os.path.dirname(x) for x in (r["file_word"], r["file_pdf"]) if x} or {os.path.dirname(max(ds)[1])} if ds else set()
+    chon, key, kq = {r["file_word"], r["file_pdf"]}, loi_ten(r["ten"]), []
+    for _, p in ds:
+        duoi, d = os.path.splitext(p)[1].lower().lstrip("."), os.path.dirname(p)
+        if p not in chon and ((d in tm and (duoi in DUOI_BIA or (duoi == "pdf" and pdf_mong(p))))
+                              or (any(d == t or d.startswith(t + os.sep) for t in tm) and la_bia(p, key))):
+            kq.append(p)
+    return sorted(set(kq))
+
+
+def ten_bia(ten_moi):
+    """Tên file bìa: đổi _R_ (Ruột) thành _B_ (Bìa) - 'ten_sach_0121_R_PL_T01' -> 'ten_sach_0121_B_PL_T01'."""
+    return re.sub(r"_R_(?=[A-Z0-9]+_[MT]\d\d$)", "_B_", ten_moi, count=1)
 
 
 def doi_chieu(sach, files):
     """Khớp tên sách với tên file HOẶC tên thư mục chứa file (kho xếp mỗi sách một thư mục)."""
-    theo_key, ten_sach = set(), {chuan_hoa(s["ten"]) for s in sach}
+    theo_key, ten_sach = set(), {loi_ten(s["ten"]) for s in sach}
     theo_prefix = defaultdict(list)  # ponytail: so khớp "chứa" chỉ trong nhóm cùng 3 từ đầu, tránh O(sách×file)
     theo_tm = defaultdict(list)
     for f in files:
@@ -296,7 +432,7 @@ def doi_chieu(sach, files):
 
     kq = []
     for s in sach:
-        key = chuan_hoa(s["ten"])
+        key = loi_ten(s["ten"])
         tim, rut_gon = {}, False
         for k, la_tm, x in theo_prefix.get(" ".join(key.split()[:3]), ()):
             khop = f" {key} " in f" {k} "  # gồm cả khớp chính xác
@@ -362,10 +498,13 @@ def doi_chieu_thu_muc(kq, files, cache=None):
         dau = sorted({y for t in ts if isinstance(t, dict) for y in t.get("dau", ())})
         nam = sorted(set(cuoi) | set(dau))
         doc_duoc, chua = sum(isinstance(t, dict) for t in ts), ts.count("chưa đọc")
+        n_ocr = sum(isinstance(t, dict) and bool(t.get("ocr")) and not pdf_mong(x) for x, t in zip(doc, ts))  # PDF bìa không cần OCR
         ghi = (["không có file Word/PDF (chỉ ảnh, bìa, zip...)"] if not doc else
-               [f"đọc được {doc_duoc}/{len(doc)} file Word/PDF"] + (["còn lại là .doc/scan không có chữ"] if doc_duoc + chua < len(doc) else [])
+               [f"mở được {doc_duoc}/{len(doc)} file Word/PDF"]
+               + (["còn lại không mở được (file hỏng, có mật khẩu, hoặc máy không có Word)"] if doc_duoc + chua < len(doc) else [])
                + ([f"{chua} file chưa đọc - chạy tab 3"] if chua else [])
-               + (["không thấy năm ở trang cuối lẫn 8 trang đầu (PDF scan/bìa, hoặc bản chính nằm trong .zip?)"] if doc_duoc and not nam else []))
+               + ([f"{n_ocr} file PDF cần OCR (không có lớp chữ) - xem sheet CAN_OCR"] if n_ocr else [])
+               + (["không thấy năm ở trang cuối lẫn 8 trang đầu (bản chính nằm trong .zip?)"] if doc_duoc and not nam and not n_ocr else []))
         trung = any(r["tinh_trang"] == "KHỚP" and r["nam"] in nam for _, r in khac[tm])
         kq_tm.append(dict(thu_muc=tm, ten_tm=os.path.basename(tm), so_file=len(fs),
                           loai=", ".join(f"{k.upper()} {n}" for k, n in sorted(Counter(f["dinh_dang"] for f in fs).items())),
@@ -376,20 +515,57 @@ def doi_chieu_thu_muc(kq, files, cache=None):
     return kq_tm
 
 
-def doc_thu_muc(xlsx):
-    """Đọc lại sheet THU_MUC_KHO của file doi_chieu (rỗng nếu file cũ không có)."""
+COT_OCR = [("path", "Đường dẫn"), ("ten_tm", "Thư mục"), ("ten_file", "Tên file"), ("trang", "Số trang"),
+           ("ly_do", "Lý do"), ("uu_tien", "Ưu tiên"), ("sach", "Sách liên quan (năm - dòng Excel - tên sách)")]
+LY_DO_OCR = {"scan": "PDF ảnh scan, không có lớp chữ", "hinh_ve": "PDF chữ dạng hình vẽ (outline), không có lớp chữ"}
+OCR_CAO, OCR_THAP = "CAO - thư mục chưa khớp sách nào", "thấp - thư mục đã khớp sách nhờ file khác"
+
+
+def ds_can_ocr(kq, files, cache=None):
+    """PDF đã đọc ở tab 3 mà gần như không có chữ -> cần OCR mới đọc được năm / lời nói đầu. Bỏ file bìa.
+    -> danh sách cho sheet CAN_OCR (không mở file ở đây, lấy từ cache); file ở thư mục chưa khớp sách nào xếp trước."""
+    cache = {} if cache is None else cache
+    sach, da_khop = defaultdict(list), set()
+    for r in kq:
+        for _, p in _dong_file(r["cac_file"]):
+            sach[p].append(f"{r['nam']} - dòng {r['dong']} - {r['ten']}")
+        if r["tinh_trang"] == "KHỚP":
+            da_khop |= {os.path.dirname(x) for x in (r["file_word"], r["file_pdf"]) if x}
+    ds = []
+    for f in files:
+        if f["dinh_dang"] != "pdf" or la_bia(f["path"]):
+            continue
+        t = cache.get(_khoa_cache(f["path"]))
+        if isinstance(t, dict) and t.get("ocr") and not pdf_mong(f["path"]):  # PDF bìa không cần OCR
+            ds.append(dict(path=f["path"], ten_tm=os.path.basename(os.path.dirname(f["path"])), ten_file=os.path.basename(f["path"]),
+                           trang=t.get("trang"), ly_do=LY_DO_OCR.get(t["ocr"], t["ocr"]),
+                           uu_tien=OCR_THAP if os.path.dirname(f["path"]) in da_khop else OCR_CAO, sach="\n".join(sach[f["path"]])))
+    return sorted(ds, key=lambda x: (x["uu_tien"] != OCR_CAO, x["path"]))
+
+
+def _doc_sheet(xlsx, ten, cot):
     import openpyxl
     wb = openpyxl.load_workbook(xlsx, read_only=True)
-    ten2k, rows = {h: k for k, h in COT_TM}, []
-    if "THU_MUC_KHO" in wb.sheetnames:
-        it = wb["THU_MUC_KHO"].iter_rows(values_only=True)
+    ten2k, rows = {h: k for k, h in cot}, []
+    if ten in wb.sheetnames:
+        it = wb[ten].iter_rows(values_only=True)
         keys = [ten2k.get(h) for h in next(it, ())]
         rows = [{k: ("" if v is None else v) for k, v in zip(keys, row) if k} for row in it]
     wb.close()
     return rows
 
 
-def ghi_ket_qua(kq, xlsx_goc, thu_muc_ra, thu_muc=()):
+def doc_thu_muc(xlsx):
+    """Đọc lại sheet THU_MUC_KHO của file doi_chieu (rỗng nếu file cũ không có)."""
+    return _doc_sheet(xlsx, "THU_MUC_KHO", COT_TM)
+
+
+def doc_can_ocr(xlsx):
+    """Đọc lại sheet CAN_OCR của file doi_chieu (rỗng nếu không có)."""
+    return _doc_sheet(xlsx, "CAN_OCR", COT_OCR)
+
+
+def ghi_ket_qua(kq, xlsx_goc, thu_muc_ra, thu_muc=(), can_ocr=()):
     import openpyxl
     os.makedirs(thu_muc_ra, exist_ok=True)
     tem = dt.datetime.now().strftime("%Y%m%d_%H%M")
@@ -402,18 +578,21 @@ def ghi_ket_qua(kq, xlsx_goc, thu_muc_ra, thu_muc=()):
         for r in kq:
             if loc(r):
                 ws.append([_cell(r.get(k, "")) for k, _ in COT_KQ])
-    if thu_muc:
-        ws = wb.create_sheet("THU_MUC_KHO")
-        ws.append([h for _, h in COT_TM])
-        for r in thu_muc:
-            ws.append([_cell(r.get(k, "")) for k, _ in COT_TM])
-        ws.auto_filter.ref = ws.dimensions
-        ws.freeze_panes = "A2"
+    for ten, rows, cot in (("THU_MUC_KHO", thu_muc, COT_TM), ("CAN_OCR", can_ocr, COT_OCR)):
+        if rows:
+            ws = wb.create_sheet(ten)
+            ws.append([h for _, h in cot])
+            for r in rows:
+                ws.append([_cell(r.get(k, "")) for k, _ in cot])
+            ws.auto_filter.ref = ws.dimensions
+            ws.freeze_panes = "A2"
     del wb["Sheet"]
     ra1 = os.path.join(thu_muc_ra, f"doi_chieu_{tem}.xlsx")
     wb.save(ra1)
 
-    # bước 6: đánh dấu tình trạng vào bản sao file excel gốc
+    # đánh dấu tình trạng vào bản sao file Excel tổng hợp; dòng KHỚP tô vàng cả dòng
+    from openpyxl.styles import PatternFill
+    vang = PatternFill("solid", fgColor="FFFF00")
     wb = openpyxl.load_workbook(xlsx_goc)
     theo_nam = defaultdict(list)
     for r in kq:
@@ -428,6 +607,9 @@ def ghi_ket_qua(kq, xlsx_goc, thu_muc_ra, thu_muc=()):
             ws.cell(r["dong"], c + 1, _cell("\n".join(x for x in (r["file_word"], r["file_pdf"]) if x)))
             ws.cell(r["dong"], c + 2, r["ten_moi"])
             ws.cell(r["dong"], c + 3, _cell(r.get("dich", "")))
+            if r["tinh_trang"] == "KHỚP":
+                for cot in range(1, c + 4):
+                    ws.cell(r["dong"], cot).fill = vang
     ra2 = os.path.join(thu_muc_ra, f"{os.path.splitext(os.path.basename(xlsx_goc))[0]}_danh_dau_{tem}.xlsx")
     wb.save(ra2)
     return ra1, ra2
@@ -480,7 +662,11 @@ def nam_trang_cuoi(t):
 
 
 def nam_trang_dau(t):
-    """Năm xuất bản ở 8 trang đầu (text đã chuan_hoa), lấy theo thứ tự tin cậy, có bậc nào thì dừng ở bậc đó:
+    return nam_trang_dau_bac(t)[0]
+
+
+def nam_trang_dau_bac(t):
+    """-> (năm, bậc tin cậy 1/2/3, 0 nếu không có). Năm xuất bản ở 8 trang đầu (text đã chuan_hoa), lấy theo thứ tự tin cậy, có bậc nào thì dừng ở bậc đó:
     1. khối thông tin XB đặt ở đầu sách (đăng ký / quyết định XB, lưu chiểu), tính đến chữ ISBN;
     2. biên mục CIP '... quốc gia, 2021. - 312tr.' và trang tên sách 'Nhà xuất bản ... Hà Nội - 2021';
     3. chữ ký lời NXB 'tháng 3 năm 2021 Nhà xuất bản' (có thể ký trước năm XB).
@@ -488,15 +674,23 @@ def nam_trang_dau(t):
     nam = lambda x: sorted({int(y) for y in re.findall(r"\b20\d\d\b", x)})
     m = re.search(r"\b(quyet dinh|giay phep|dang ky)( ke hoach)? xuat ban\b|\bl\w{0,2}u chi\w{0,3}u\b", t)
     if m and nam(t[m.start():m.start() + 300].split(" isbn ")[0]):
-        return nam(t[m.start():m.start() + 300].split(" isbn ")[0])
+        return nam(t[m.start():m.start() + 300].split(" isbn ")[0]), 1
     ys = {int(y) for pat in (r"\b(20\d\d) \d+ ?tr\b", r"\bnha xuat ban [a-z ]{0,50}?\bha noi (20\d\d)\b")
           for y in re.findall(pat, t)}
-    return sorted(ys) or sorted({int(y) for y in re.findall(r"\bthang \d{1,2} nam (20\d\d) nh\w{0,2} xu", t)})
+    if ys:
+        return sorted(ys), 2
+    ys = sorted({int(y) for y in re.findall(r"\bthang \d{1,2} nam (20\d\d) nh\w{0,2} xu", t)})
+    return ys, 3 if ys else 0
 
 
 def khop_nam(t, nam):
-    """Ưu tiên trang cuối, không khớp thì xét 8 trang đầu -> 'trang cuối' / '8 trang đầu' / ''."""
-    return "trang cuối" if nam in t["nam"] else "8 trang đầu" if nam in t.get("dau", ()) else ""
+    """Ưu tiên trang cuối, không khớp thì xét 8 trang đầu -> 'trang cuối' / '8 trang đầu' / ''.
+    Ngày ký lời NXB (bậc 3) thường là năm in lần đầu, sách tái bản vẫn giữ: không dùng khi trang cuối đã ghi năm khác."""
+    if nam in t["nam"]:
+        return "trang cuối"
+    if nam in t.get("dau", ()) and not (t["nam"] and t.get("dau_bac") == 3):
+        return "8 trang đầu"
+    return ""
 
 
 def cac_nam(t):
@@ -601,13 +795,22 @@ def trich(path, so_trang=8):
     """-> {'nam': năm XB ở trang cuối, 'dau': năm XB ở 8 trang đầu, 'lnd': đoạn 'cuốn sách ...' trong lời nói đầu}.
     PDF theo trang; .docx/.doc theo số ký tự KY_DAU/KY_CUOI (.doc đọc qua Microsoft Word). None nếu không đọc được."""
     ext = os.path.splitext(path)[1].lower()
-    p = duong_dan_dai(path)
+    p, them = duong_dan_dai(path), {}
     try:
         if ext == ".pdf":
             import fitz
             with fitz.open(p) as d:
-                dau = " ".join(d[i].get_text() for i in range(min(so_trang, len(d))))
-                cuoi = " ".join(d[i].get_text() for i in range(max(0, len(d) - 2), len(d)))
+                n = len(d)
+                xem = sorted(set(range(min(so_trang, n))) | set(range(max(0, n - 2), n)))
+                chu = {i: d[i].get_text() for i in xem}
+                dau = " ".join(chu[i] for i in range(min(so_trang, n)))
+                cuoi = " ".join(chu[i] for i in range(max(0, n - 2), n))
+                # ponytail: không có OCR - PDF gần như không có lớp chữ thì chỉ đánh dấu 'cần OCR' (sheet CAN_OCR);
+                # muốn đọc được thì OCR riêng các trang này (vd Tesseract + gói tiếng Việt) rồi lưu cache như file khác
+                ocr = ""
+                if n and len(re.sub(r"\s", "", "".join(chu.values()))) < 100:
+                    ocr = "scan" if any(d[i].get_images() for i in xem) else "hinh_ve"
+                them = dict(ocr=ocr, trang=n)
         elif ext == ".docx":
             t = _docx_text(p)
             dau, cuoi = t[:KY_DAU], t[-KY_CUOI:]
@@ -620,14 +823,52 @@ def trich(path, so_trang=8):
             return None
     except Exception:
         return None
-    return dict(nam=nam_trang_cuoi(chuan_hoa(cuoi)), dau=nam_trang_dau(chuan_hoa(dau)), lnd=loi_noi_dau(dau))
+    nam_dau, bac = nam_trang_dau_bac(chuan_hoa(dau))
+    return dict(nam=nam_trang_cuoi(chuan_hoa(cuoi)), dau=nam_dau, dau_bac=bac, lnd=loi_noi_dau(dau), **them)
+
+
+def _pid_song(pid):
+    """Tiến trình pid còn chạy không (Windows)."""
+    import ctypes
+    k = ctypes.windll.kernel32
+    h = k.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if not h:
+        return False
+    try:
+        return k.WaitForSingleObject(h, 0) == 0x102  # WAIT_TIMEOUT: chưa kết thúc
+    finally:
+        k.CloseHandle(h)
 
 
 class Cache:
-    """Cache kết quả đọc file trong SQLite trên đĩa: không chiếm RAM, ghi từng mục, chạy lại dùng tiếp."""
+    """Cache kết quả đọc file trong SQLite trên đĩa: không chiếm RAM, lưu ngay sau từng file, chạy lại dùng tiếp.
+    Trước khi đọc mỗi file ghi dấu 'đang đọc'. Lần mở sau còn dấu của một tiến trình đã chết = tool tắt đột ngột khi
+    đọc file đó (thường do file PDF hỏng làm thư viện đọc PDF sập) -> file đó coi là không đọc được, bỏ qua, ghi vào vua_loi."""
     def __init__(self, path):
         self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db.execute("pragma journal_mode=wal")  # ghi nhanh, lưu sau từng file vẫn không chậm
+        self.db.execute("pragma synchronous=normal")
         self.db.execute("create table if not exists c (k text primary key, v text)")
+        self.db.execute("create table if not exists dang_doc (pid integer primary key, k text, path text)")
+        self.db.execute("create table if not exists file_loi (path text primary key, ly_do text, luc text)")
+        self.vua_loi = []
+        for pid, k, p in self.db.execute("select pid, k, path from dang_doc").fetchall():
+            if pid == os.getpid() or _pid_song(pid):
+                continue  # đang có tiến trình khác / luồng khác đọc thật
+            self[k] = None
+            self.db.execute("insert or replace into file_loi values (?, ?, ?)",
+                            (p, "tool tắt đột ngột khi đang đọc file này", dt.datetime.now().isoformat(" ", "seconds")))
+            self.db.execute("delete from dang_doc where pid = ?", (pid,))
+            self.vua_loi.append(p)
+        self.db.commit()
+
+    def doc(self, k, path, ham):
+        """Đọc 1 file: ghi dấu 'đang đọc' xuống đĩa, đọc, lưu kết quả, xoá dấu."""
+        self.db.execute("insert or replace into dang_doc values (?, ?, ?)", (os.getpid(), k, path)); self.db.commit()
+        v = ham()
+        self[k] = v
+        self.db.execute("delete from dang_doc where pid = ?", (os.getpid(),)); self.db.commit()
+        return v
 
     def get(self, k, mac_dinh=None):
         row = self.db.execute("select v from c where k = ?", (k,)).fetchone()
@@ -668,9 +909,9 @@ def ghi_cache(cache, path):
 
 
 def _khoa_cache(path):
-    """Khoá cache theo (path, mtime); None nếu file không còn. |8: đổi khi cách trích thay đổi."""
+    """Khoá cache theo (path, mtime); None nếu file không còn. |10: đổi khi cách trích thay đổi."""
     try:
-        return f"{path}|{int(os.path.getmtime(duong_dan_dai(path)))}|8"
+        return f"{path}|{int(os.path.getmtime(duong_dan_dai(path)))}|10"
     except OSError:
         return None
 
@@ -682,7 +923,10 @@ def trich_cache(cache, path):
         return None
     v = cache.get(k, KeyError)
     if v is KeyError:
-        v = cache[k] = trich(path)
+        if isinstance(cache, Cache):
+            v = cache.doc(k, path, lambda: trich(path))
+        else:
+            v = cache[k] = trich(path)
     return v
 
 
@@ -716,10 +960,22 @@ def _chon(r, ok, ghi_chu, cung_tm=()):
     return True
 
 
-def xu_ly_lech_nam(r, cache):
+def file_theo_dm(kq):
+    """{đường dẫn: năm} các file đã khớp sách theo Date Modified ở bước khớp tên (dòng KHỚP, file cùng năm với dòng)."""
+    return {p: r["nam"] for r in kq if r["tinh_trang"] == "KHỚP"
+            for d, p in _dong_file(r["cac_file"]) if d[:4] == str(r["nam"])}
+
+
+def xu_ly_lech_nam(r, cache, theo_dm=None):
     """Dòng LỆCH NĂM: mở từng file trong 'Tất cả file tìm được', nhận file có năm cột Năm ở trang cuối,
-    không có thì ở 8 trang đầu (cùng các file khác trong thư mục đó)."""
-    ok, ghi, thay, nguon, ds = [], [], set(), set(), _dong_file(r["cac_file"])
+    không có thì ở 8 trang đầu (cùng các file khác trong thư mục đó).
+    theo_dm (file_theo_dm): file đã thuộc sách năm khác theo Date Modified thì không xét lại bằng nội dung."""
+    theo_dm = theo_dm or {}
+    ds = [x for x in _dong_file(r["cac_file"]) if theo_dm.get(x[1], r["nam"]) == r["nam"]]
+    ok, ghi, thay, nguon, ocr = [], [], set(), set(), []
+    for _, p in _dong_file(r["cac_file"]):
+        if theo_dm.get(p, r["nam"]) != r["nam"]:
+            ghi.append(f"{os.path.basename(p)} đã thuộc sách năm {theo_dm[p]} theo Date Modified")
     for d, p in ds:
         if not p.lower().endswith((".pdf", ".doc", ".docx")):  # ảnh bìa... không có năm để đọc
             continue
@@ -728,11 +984,15 @@ def xu_ly_lech_nam(r, cache):
             ghi.append(f"bỏ qua (không đọc được): {os.path.basename(p)}")
             continue
         thay.update(cac_nam(t))
+        if t.get("ocr") and not la_bia(p, chuan_hoa(r["ten"])) and not pdf_mong(p):
+            ocr.append(f"{os.path.basename(p)} ({t['trang']} trang)")
         if khop_nam(t, r["nam"]):
             ok.append((d, p)); nguon.add(khop_nam(t, r["nam"]))
     nhan = f"khớp theo nội dung ({', '.join(sorted(nguon, reverse=True))})"
     if not _chon(r, ok, nhan, [x for x in ds if _khong_lech(cache, x[1], r["nam"], chuan_hoa(r["ten"]))]):
         ghi.insert(0, f"không thấy năm {r['nam']} ở trang cuối/8 trang đầu (thấy: {', '.join(map(str, sorted(thay))) or '-'})")
+        if ocr:
+            ghi.append("cần OCR (PDF không có lớp chữ): " + ", ".join(ocr))
         r["ghi_chu"] = "; ".join(ghi)
 
 
@@ -757,7 +1017,7 @@ def xu_ly_khong_tim_thay(rows, files, cache, progress=None):
     """Dòng KHÔNG TÌM THẤY: tìm trong lời nói đầu câu giới thiệu 'cuốn sách <tên sách>', rồi kiểm tra năm trang cuối."""
     theo_prefix = defaultdict(list)
     for r in rows:
-        r["_key"], r["_tim"] = chuan_hoa(r["ten"]), {}
+        r["_key"], r["_tim"] = loi_ten(r["ten"]), {}
         theo_prefix[" ".join(r["_key"].split()[:3])].append(r)
     theo_tm = defaultdict(list)
     for f in files:
@@ -772,7 +1032,7 @@ def xu_ly_khong_tim_thay(rows, files, cache, progress=None):
                     for r in theo_prefix.get(" ".join(w[j:j + n]), ()):
                         if nhac_ten_sach(lnd, r["_key"]):
                             r["_tim"][f["path"]] = (f, t)
-        if progress and i % 200 == 0:
+        if progress:
             progress(i)
     for r in rows:
         tim, _ = r.pop("_tim"), r.pop("_key")
@@ -791,11 +1051,15 @@ def xu_ly_khong_tim_thay(rows, files, cache, progress=None):
 # ---------- đổi tên & lưu ----------
 def ke_hoach_luu(kq, thu_muc_dich):
     """-> [(r, nguồn, đích)] cho dòng KHỚP. Mỗi sách một thư mục:
-    <đích>/<Năm>/thang <MM>/<Tên file mới>/<Tên file mới><đuôi>; thư mục trùng tên thêm _2, _3."""
+    <đích>/<Năm>/thang <MM>/<Tên file mới>/<Tên file mới><đuôi>; thư mục trùng tên thêm _2, _3.
+    File bìa (ds_bia) vào <thư mục sách>/Bia/<tên mới đổi _R_ thành _B_><đuôi>; nhiều bìa cùng đuôi thì _2, _3,
+    tên đã có file khác thì lấy tên kế tiếp (không ghi đè)."""
     da_dung, kh = set(), []
     for r in kq:
-        nguon = [x for x in (r["file_word"], r["file_pdf"]) if x]
-        if r["tinh_trang"] != "KHỚP" or not nguon:
+        if r["tinh_trang"] != "KHỚP":
+            continue
+        nguon, cac_bia = [x for x in (r["file_word"], r["file_pdf"]) if x], ds_bia(r)
+        if not (nguon or cac_bia):  # sách chỉ có bìa: vẫn lưu bìa vào <thư mục sách>/Bia
             continue
         goc = os.path.join(thu_muc_dich, str(r["nam"]), f"thang {thang_qdxb(r['qdxb'])}", r["ten_moi"])
         tm, i = goc, 1
@@ -807,6 +1071,15 @@ def ke_hoach_luu(kq, thu_muc_dich):
         da_dung.add(tm.lower())
         ten = os.path.basename(tm)
         kh += [(r, src, os.path.join(tm, ten + os.path.splitext(src)[1].lower())) for src in nguon]
+        bia = ten_bia(r["ten_moi"])
+        for src in cac_bia:
+            duoi, j = os.path.splitext(src)[1].lower(), 1
+            dst = os.path.join(tm, "Bia", bia + duoi)
+            while dst.lower() in da_dung or (os.path.exists(duong_dan_dai(dst)) and not da_co(src, dst)):
+                j += 1
+                dst = os.path.join(tm, "Bia", f"{bia}_{j}{duoi}")
+            da_dung.add(dst.lower())
+            kh.append((r, src, dst))
     return kh
 
 
@@ -827,14 +1100,15 @@ def _con_trong(p):
 
 def luu_file(kh, di_chuyen=False, progress=None):
     """Copy (hoặc move) theo kế hoạch, ghi đường dẫn đích vào r['dich']. File đã có thì bỏ qua (chạy lại được);
-    lỗi ở file nào thì ghi vào Ghi chú rồi làm tiếp. -> (số file đã chép, số đã có sẵn, [lỗi])."""
+    lỗi ở file nào thì ghi vào Ghi chú rồi làm tiếp. -> (số file đã chép, số đã có sẵn, [lỗi]).
+    progress(i, byte đã chép, tổng byte cần chép) sau mỗi file: thời gian chép theo dung lượng, không theo số file."""
     can = [(r, src, p) for r, src, p in kh if not da_co(src, p)]
     cung_o = lambda src, p: os.path.splitdrive(os.path.abspath(src))[0].lower() == os.path.splitdrive(os.path.abspath(p))[0].lower()
-    byte = sum(os.path.getsize(duong_dan_dai(src)) for _, src, p in can
-               if os.path.exists(duong_dan_dai(src)) and not (di_chuyen and cung_o(src, p)))
+    kt = {(src, p): os.path.getsize(duong_dan_dai(src)) for _, src, p in can if os.path.exists(duong_dan_dai(src))}  # theo cặp: 1 nguồn có thể chép tới 2 nơi
+    byte = sum(kt.get((src, p), 0) for _, src, p in can if not (di_chuyen and cung_o(src, p)))
     if can and byte > _con_trong(can[0][2]):
         raise ValueError(f"Ổ đích không đủ chỗ: cần {byte / 2**30:.1f} GB, còn {_con_trong(can[0][2]) / 2**30:.1f} GB")
-    chep, co_san, loi = 0, 0, []
+    chep, co_san, loi, da_chep, tong = 0, 0, [], 0, sum(kt.values())
     for i, (r, src, p) in enumerate(kh, 1):
         if DUNG.is_set():  # dừng: phần đã chép giữ nguyên, chạy lại sẽ làm tiếp
             break
@@ -846,13 +1120,13 @@ def luu_file(kh, di_chuyen=False, progress=None):
                 tam = p + ".dang_chep"  # chép ra tên tạm rồi đổi tên: dừng giữa chừng không để lại file dở mang tên thật
                 (shutil.move if di_chuyen else shutil.copy2)(duong_dan_dai(src), duong_dan_dai(tam))
                 os.replace(duong_dan_dai(tam), duong_dan_dai(p))
-                chep += 1
+                chep += 1; da_chep += kt.get((src, p), 0)
             r["dich"] = "\n".join(x for x in (r.get("dich", ""), p) if x)
         except OSError as e:
             loi.append(f"{src}: {e}")
             r["ghi_chu"] = "; ".join(x for x in (r.get("ghi_chu", ""), f"LỖI lưu {os.path.basename(src)}: {e.strerror or e}") if x)
-        if progress and i % 100 == 0:
-            progress(i)
+        if progress:
+            progress(i, da_chep, tong)
     return chep, co_san, loi
 
 
@@ -863,22 +1137,38 @@ def moi_nhat(*mau):
 
 
 # ---------- giao diện ----------
-def gui():
+def gui(so_tab=2):
+    """Giao diện. so_tab=2 (SXBTool.exe): 1. Đối chiếu (quét kho -> khớp tên -> kiểm tra nội dung, một nút) | 2. Đổi tên & lưu.
+    so_tab=4 (SXBTool_4tab.exe): 1. Quét kho | 2. Đối chiếu Excel | 3. Kiểm tra nội dung | 4. Đổi tên & lưu - từng bước riêng.
+    Hai bản dùng chung các bước xử lý bên dưới, chung thư mục ketqua/ và chung cache."""
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
 
-    # kết quả gom vào ketqua/ cạnh file exe (hoặc cạnh sxb_tool.py), mỗi bước một thư mục
-    goc = os.path.join(os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)), "ketqua")
-    TM = {k: os.path.join(goc, k) for k in ("1_quet_kho", "2_doi_chieu", "3_kiem_tra", "4_doi_ten", "sach_da_luu")}
+    # kết quả gom vào ketqua/ cạnh file exe (hoặc cạnh sxb_tool.py)
+    noi = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+    goc = os.path.join(noi, "ketqua")
+    # Excel tổng hợp mặc định: cạnh exe (hoặc sxb_tool.py), không có thì ở thư mục cha (exe nằm trong dist\)
+    XL_MD = next((f for d in (noi, os.path.dirname(noi)) for f in [os.path.join(d, XL_TONG_HOP)] if os.path.isfile(f)), "")
+    TM = {k: os.path.join(goc, k) for k in ("1_quet_kho", "2_doi_chieu", "3_doi_ten", "sach_da_luu")}
     for d in TM.values():
         os.makedirs(d, exist_ok=True)
-    # ô đầu vào mặc định = file kết quả mới nhất của bước trước
     KHO = (os.path.join(TM["1_quet_kho"], "kho_*.xlsx"), os.path.join(TM["1_quet_kho"], "kho_*.csv"))
-    DC2, DC3 = (os.path.join(TM[k], "doi_chieu_*.xlsx") for k in ("2_doi_chieu", "3_kiem_tra"))
+    # file doi_chieu mới nhất (cả thư mục 3_kiem_tra của phiên bản cũ)
+    DC = (os.path.join(TM["2_doi_chieu"], "doi_chieu_*.xlsx"), os.path.join(goc, "3_kiem_tra", "doi_chieu_*.xlsx"))
+    # cache đọc nội dung dùng chung mọi lần chạy (khoá theo đường dẫn + ngày sửa file) nên quét lại kho vẫn dùng được
+    CACHE = os.path.join(TM["1_quet_kho"], "cache_noi_dung.sqlite")
+
+    # nhật ký lỗi: cả lỗi sập ở tầng C (vd file PDF hỏng làm thư viện đọc PDF sập) để biết tool tắt ở đâu
+    NK_LOI = os.path.join(goc, "nhat_ky_loi.txt")
+    flog = open(NK_LOI, "a", encoding="utf-8", buffering=1)
+    flog.write(f"\n=== mở tool {dt.datetime.now():%d/%m/%Y %H:%M:%S} (bản {so_tab} tab, pid {os.getpid()}) ===\n")
+    faulthandler.enable(flog, all_threads=True)
+    # quét kho ghi dần vào nhật ký này; tool tắt / bấm Dừng giữa chừng thì lần sau hỏi quét tiếp
+    NK_QUET = os.path.join(TM["1_quet_kho"], "quet_dang_do.csv")
 
     root = tk.Tk()
-    root.title("Tool SXB - quét kho, đối chiếu, kiểm tra nội dung, đổi tên")
-    root.geometry("820x580")
+    root.title("Tool SXB - đối chiếu kho sách với Excel tổng hợp, đổi tên & lưu" + (" (bản 4 tab)" if so_tab == 4 else ""))
+    root.geometry("820x660")
     thanh = ttk.Frame(root); thanh.pack(side="bottom", fill="x", padx=8, pady=(0, 8))
     b_dung = ttk.Button(thanh, text="■ Dừng", state="disabled", command=lambda: (DUNG.set(), b_dung.config(state="disabled")))
     b_dung.pack(side="right")
@@ -900,6 +1190,22 @@ def gui():
         ttk.Entry(parent, textvariable=var, width=70).grid(row=r, column=1, sticky="we")
         if chon:
             ttk.Button(parent, text="...", width=3, command=lambda: var.set(chon() or var.get())).grid(row=r, column=2)
+
+    def khung(parent, dong):
+        """Thanh tiến độ + dòng trạng thái + khung log, từ hàng `dong` trở xuống."""
+        pb = ttk.Progressbar(parent, maximum=1000); pb.grid(row=dong, column=0, columnspan=3, sticky="we", pady=(6, 0))
+        lb = ttk.Label(parent, text=""); lb.grid(row=dong + 1, column=0, columnspan=3, sticky="w")
+        tx = tk.Text(parent, height=10, wrap="word"); tx.grid(row=dong + 2, column=0, columnspan=3, sticky="we", pady=6)
+        return pb, lb, tx
+
+    def bat(pb, ham):
+        """Lỗi giữa chừng: dừng thanh chạy qua lại (không đụng thanh đã đầy khi xong)."""
+        def chay_ham(*a):
+            try:
+                ham(*a)
+            finally:
+                ui(lambda: str(pb.cget("mode")) == "indeterminate" and pb.stop())
+        return chay_ham
 
     dang_chay = [0]
 
@@ -924,184 +1230,318 @@ def gui():
                 ui(lambda: bao(msg, "ĐÃ DỪNG"))
             except Exception as e:
                 msg = str(e) or type(e).__name__
+                flog.write(f"{dt.datetime.now():%d/%m/%Y %H:%M:%S} LỖI: {traceback.format_exc()}")
                 ui(lambda: bao(msg))
             finally:
                 ui(xong)
         threading.Thread(target=run, daemon=True).start()
 
+    def tien_do(pb, lb):
+        """-> (bao, het). bao(buoc, xong, tong): thanh tiến độ + '...: 120/690 (17%) - đã chạy 2 phút - còn khoảng 9 phút';
+        bao(buoc) không kèm số: thanh chạy qua lại. het(chu): thanh đầy, hiện dòng kết thúc. Vẽ lại tối đa ~3 lần/giây."""
+        st = {"buoc": None, "t0": 0.0, "ve": 0.0}
+        def bao(buoc, xong=None, tong=None, hien=None):
+            bay = time.time()
+            if buoc != st["buoc"]:
+                st.update(buoc=buoc, t0=bay, ve=0.0)
+            elif xong is not None and xong < tong and bay - st["ve"] < 0.3:
+                return
+            st["ve"] = bay
+            if xong is None:
+                ui(lambda: (pb.config(mode="indeterminate"), pb.start(15), lb.config(text=f"{buoc}...")))
+                return
+            da = bay - st["t0"]
+            con = f" - còn khoảng {_gio(da / xong * (tong - xong))}" if 0 < xong < tong else ""
+            chu = f"{buoc}: {hien or f'{xong}/{tong}'} ({xong / max(tong, 1):.0%}) - đã chạy {_gio(da)}{con}"
+            ui(lambda: (pb.stop(), pb.config(mode="determinate", value=1000 * xong / max(tong, 1)), lb.config(text=chu)))
+        def het(chu):
+            ui(lambda: (pb.stop(), pb.config(mode="determinate", value=1000), lb.config(text=chu)))
+        return bao, het
+
     def logger(txt):
         return lambda s: root.after(0, lambda: (txt.insert("end", s + "\n"), txt.see("end")))
 
-    # --- tab 1: quét ---
-    t1 = ttk.Frame(nb, padding=10); nb.add(t1, text="1. Quét kho → Excel")
-    v_tm, v_ext, v_csv, tu_dong = tk.StringVar(), tk.StringVar(value=EXT_MAC_DINH), tk.StringVar(), []
-    hang(t1, 0, "Thư mục kho", v_tm, filedialog.askdirectory)
-    hang(t1, 1, "Định dạng (cách)", v_ext)
-    hang(t1, 2, "File Excel xuất", v_csv,
-         lambda: filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")]))
-    tt1 = ttk.Label(t1, text="", wraplength=700); tt1.grid(row=4, column=0, columnspan=3, sticky="w", pady=4)
-    tt1l = tk.Text(t1, height=10, wrap="word"); tt1l.grid(row=5, column=0, columnspan=3, sticky="we", pady=4)
-
-    def quet_gui():
-        if not os.path.isdir(v_tm.get()): raise ValueError("Chưa chọn thư mục kho")
-        ra = v_csv.get()
-        if not ra or ra in tu_dong:  # tên tự đặt -> mỗi lần quét một file mới, không ghi đè
-            ra = os.path.join(TM["1_quet_kho"], f"kho_{dt.datetime.now():%Y%m%d_%H%M%S}.xlsx"); tu_dong.append(ra); ui(v_csv.set, ra)
-        log, bc, t0 = logger(tt1l), {}, time.time()
-        def prog(n, root_dir): ui(lambda: tt1.config(text=f"Đã quét {n} file ({_gio(time.time() - t0)})... {root_dir[-80:]}"))
+    # ================= các bước dùng chung cho bản 2 tab và 4 tab =================
+    def buoc_quet(thu_muc, exts, log, bao, nhan):
+        """Quét kho -> file kho_*.xlsx mới trong 1_quet_kho; log số file theo định dạng, ảnh JPG, thư mục không đọc được."""
+        kho, bc, t0 = os.path.join(TM["1_quet_kho"], f"kho_{dt.datetime.now():%Y%m%d_%H%M%S}.xlsx"), {}, time.time()
+        if os.path.exists(NK_QUET):  # lần quét trước bị dừng hoặc tool tắt giữa chừng
+            with open(NK_QUET, encoding="utf-8", newline="") as f:
+                dau = next(csv.reader(f), ["#", "?", ""])
+            luc = f"{dt.datetime.fromtimestamp(os.path.getmtime(NK_QUET)):%d/%m/%Y %H:%M}"
+            if os.path.normcase(dau[1]) == os.path.normcase(os.path.abspath(thu_muc)) and \
+                    dau[2] == " ".join(sorted(e if e.startswith(".") else "." + e for e in exts)):
+                if not hoi(f"Lần quét kho trước bị dừng hoặc tool tắt giữa chừng (lần ghi cuối {luc}).\n\n"
+                           "Có: quét tiếp phần còn lại (bỏ qua các thư mục đã quét).\nKhông: bỏ phần đã quét, quét lại từ đầu."):
+                    os.remove(NK_QUET)
+            elif hoi(f"Có lần quét dở (lần ghi cuối {luc}) của thư mục khác:\n{dau[1]}\n\nBỏ lần quét dở đó để quét thư mục này?"):
+                os.remove(NK_QUET)
+            else:
+                raise ValueError(f"Chưa quét: đang giữ lần quét dở của {dau[1]} - chọn lại đúng thư mục đó để quét tiếp.")
+        bao(nhan)
+        def prog(n, root_dir): bao(f"{nhan}: đã quét {n} file, {_gio(time.time() - t0)}")
         try:
-            n = quet(v_tm.get(), v_ext.get().split(), ra, prog, bc)
+            n = quet(thu_muc, exts, kho, prog, bc, NK_QUET)
         except DaDung:
-            raise DaDung(f"Đã dừng sau {sum(bc['dinh_dang'].values())} file - chưa lưu file kho vì quét chưa xong.")
-        ui(v_csv2.set, ra); ui(v_csv3.set, ra); ui(lambda: tt1.config(text=""))
-        log(f"Xong: {n} file trong {_gio(time.time() - t0)} → {ra}")
+            raise DaDung(f"Đã dừng khi đang quét kho (sau {sum(bc['dinh_dang'].values())} file). Phần đã quét được giữ lại, "
+                         "chạy lại sẽ hỏi quét tiếp.")
+        if bc.get("tiep"):
+            log(f"Quét tiếp lần dở: {bc['tiep']} file đã quét từ trước, không quét lại.")
+        log(f"Quét kho: {n} file trong {_gio(time.time() - t0)} → {kho}")
         log("  " + ", ".join(f"{k} {v}" for k, v in bc["dinh_dang"].most_common()))
         anh = bc["dinh_dang"]["JPG"] + bc["dinh_dang"]["JPEG"]
         if n and anh / n > 0.5:
             log(f"  CHÚ Ý: ảnh JPG chiếm {anh / n:.0%} ({anh} file). Nếu đây là ảnh scan từng trang, nên bỏ .jpg .jpeg ở ô "
-                "Định dạng rồi quét lại: file kho nhỏ hơn, các bước sau nhanh và ít RAM hơn.")
+                "Định dạng rồi chạy lại: file kho nhỏ hơn, các bước sau nhanh và ít RAM hơn.")
         if bc["loi"]:
-            ds_loi = ra + ".loi.txt"
+            ds_loi = kho + ".loi.txt"
             with open(ds_loi, "w", encoding="utf-8-sig") as f:
                 f.write("\n".join(bc["loi"]))
             log(f"  CHÚ Ý: {len(bc['loi'])} thư mục/file KHÔNG đọc được (không có quyền, đường dẫn hỏng...) - "
                 f"file trong đó không có trong kho. Danh sách: {ds_loi}")
             for x in bc["loi"][:10]:
                 log(f"    {x}")
-    b1 = ttk.Button(t1, text="Quét", command=lambda: chay(b1, quet_gui, tt1l)); b1.grid(row=3, column=1, sticky="w", pady=6)
+        return kho
 
-    # --- tab 2: đối chiếu ---
-    t2 = ttk.Frame(nb, padding=10); nb.add(t2, text="2. Đối chiếu Excel")
-    v_xl, v_csv2, v_ra = tk.StringVar(), tk.StringVar(value=moi_nhat(*KHO)), tk.StringVar(value=TM["2_doi_chieu"])
-    hang(t2, 0, "File Excel tổng hợp", v_xl, chon_xlsx)
-    hang(t2, 1, "File kho (xlsx)", v_csv2, lambda: chon_csv() or v_csv.get())
-    hang(t2, 2, "Thư mục kết quả", v_ra, filedialog.askdirectory)
-    tt2 = tk.Text(t2, height=9, wrap="word"); tt2.grid(row=4, column=0, columnspan=3, sticky="we", pady=8)
-
-    def doi_chieu_gui():
-        csvp = v_csv2.get() or v_csv.get()
-        if not os.path.isfile(v_xl.get()): raise ValueError("Chưa chọn file Excel")
-        if not os.path.isfile(csvp): raise ValueError("Chưa chọn file kho")
-        log = logger(tt2)
-        log("Đọc Excel..."); sach = doc_excel(v_xl.get()); log(f"  {len(sach)} đầu sách")
-        log("Đọc file kho..."); files = doc_kho(csvp); log(f"  {len(files)} file")
-        kq = doi_chieu(sach, files)
-        dem = defaultdict(int)
-        for r in kq: dem[r["tinh_trang"]] += 1
-        for k, v in dem.items(): log(f"  {k}: {v}")
-        c = doc_cache(csvp + ".cache.sqlite"); tm = doi_chieu_thu_muc(kq, files, c); c.dong()
-        for k, v in Counter(x["tinh_trang"] for x in tm).items(): log(f"  Thư mục kho - {k}: {v}")
-        ra1, ra2 = ghi_ket_qua(kq, v_xl.get(), v_ra.get(), tm)
-        ui(v_dc.set, ra1); ui(v_dc4.set, ra1)
-        log(f"Kết quả: {ra1}\nExcel đánh dấu: {ra2}")
-    b2 = ttk.Button(t2, text="Đối chiếu", command=lambda: chay(b2, doi_chieu_gui, tt2)); b2.grid(row=3, column=1, sticky="w", pady=6)
-
-    # --- tab 3: kiểm tra nội dung ---
-    t3 = ttk.Frame(nb, padding=10); nb.add(t3, text="3. Kiểm tra nội dung")
-    v_dc, v_xl3, v_ra3 = tk.StringVar(value=moi_nhat(DC2)), tk.StringVar(), tk.StringVar(value=TM["3_kiem_tra"])
-    v_csv3 = tk.StringVar(value=moi_nhat(*KHO))
-    v_tmc, v_nam3 = tk.StringVar(), tk.StringVar()
-    v_lech, v_ktt = tk.BooleanVar(value=True), tk.BooleanVar(value=True)
-    hang(t3, 0, "File doi_chieu_*.xlsx", v_dc, chon_xlsx)
-    hang(t3, 1, "File Excel tổng hợp", v_xl3, chon_xlsx)
-    hang(t3, 2, "File kho (xlsx)", v_csv3, chon_csv)
-    hang(t3, 3, "Thư mục kết quả", v_ra3, filedialog.askdirectory)
-    ttk.Checkbutton(t3, text="Xử lý LỆCH NĂM (đọc năm ở trang cuối các file đã tìm được)", variable=v_lech)\
-        .grid(row=4, column=0, columnspan=3, sticky="w")
-    ttk.Checkbutton(t3, text="Xử lý KHÔNG TÌM THẤY (quét lời nói đầu các file trong kho, giới hạn bên dưới)", variable=v_ktt)\
-        .grid(row=5, column=0, columnspan=3, sticky="w")
-    hang(t3, 6, "  Giới hạn thư mục con", v_tmc, filedialog.askdirectory)
-    hang(t3, 7, "  Giới hạn năm DM", v_nam3)
-    ttk.Label(t3, text="(vd 2015 hoặc 2015-2017; để trống = toàn bộ kho)").grid(row=7, column=2, columnspan=2, sticky="w")
-    tt3 = tk.Text(t3, height=8, wrap="word"); tt3.grid(row=9, column=0, columnspan=3, sticky="we", pady=8)
-
-    def kiem_tra_gui():
-        xl, csvp, ra = v_xl3.get() or v_xl.get(), v_csv3.get() or v_csv2.get() or v_csv.get(), v_ra3.get() or v_ra.get()
-        for p, m in ((v_dc.get(), "file doi_chieu"), (xl, "file Excel tổng hợp"), (csvp, "file kho")):
-            if not os.path.isfile(p): raise ValueError(f"Chưa chọn {m}")
-        log = logger(tt3)
-        kq = doc_doi_chieu(v_dc.get()); files = doc_kho(csvp)
-        cache_p = csvp + ".cache.sqlite"; cache = doc_cache(cache_p)
-        log(f"{len(kq)} dòng, {len(files)} file kho, cache {len(cache)} file")
+    def buoc_noi_dung(kq, files, nhan_lech, nhan_ktt, log, bao):
+        """Kiểm tra nội dung: năm xuất bản cho dòng LỆCH NĂM (nhan_lech), lời nói đầu cho dòng KHÔNG TÌM THẤY (nhan_ktt).
+        Nhãn rỗng = bỏ bước đó. Sửa thẳng các dòng trong kq."""
+        cache = doc_cache(CACHE)
+        for x in cache.vua_loi:
+            log(f"CHÚ Ý: lần chạy trước tool tắt đột ngột khi đang đọc file này (file hỏng?) - lần này bỏ qua, "
+                f"coi là không đọc được: {x}")
+            flog.write(f"File làm tool tắt, đã đánh dấu bỏ qua: {x}\n")
         try:
-            if v_lech.get():
+            if nhan_lech:
                 lech = [r for r in kq if str(r["tinh_trang"]).startswith("LỆCH NĂM")]
-                log(f"LỆCH NĂM: {len(lech)} dòng...")
-                t0 = time.time()
-                for i, r in enumerate(lech, 1):
+                theo_dm = file_theo_dm(kq)  # file đã khớp năm khác theo Date Modified: không đọc nội dung cho dòng này
+                # tiến độ tính theo số file (không trùng) phải mở, không theo số dòng: mỗi sách nhiều ít file khác nhau,
+                # nhiều dòng (cùng tên sách, khác năm) dùng chung một thư mục -> file đã đọc thì lần sau lấy từ cache
+                so = [{p for _, p in _dong_file(r["cac_file"]) if p.lower().endswith((".pdf", ".doc", ".docx"))} for r in lech]
+                da, tong, t0 = set(), len(set().union(*so)), time.time()
+                log(f"LỆCH NĂM: {len(lech)} dòng, {tong} file Word/PDF cần mở (file đã có trong cache không phải đọc lại)")
+                bao(nhan_lech, 0, tong)
+                for i, (r, n) in enumerate(zip(lech, so), 1):
                     if DUNG.is_set():
                         break
-                    xu_ly_lech_nam(r, cache)
+                    xu_ly_lech_nam(r, cache, theo_dm); da |= n; xong = len(da)
+                    bao(nhan_lech, xong, tong)
                     if i % 50 == 0:
-                        log(f"  {i}/{len(lech)} - còn khoảng {_gio((time.time() - t0) / i * (len(lech) - i))}"); ghi_cache(cache, cache_p)
-            if v_ktt.get() and not DUNG.is_set():
+                        log(f"  {i}/{len(lech)} dòng, {xong}/{tong} file - còn khoảng {_gio((time.time() - t0) / max(xong, 1) * (tong - xong))}")
+                        ghi_cache(cache, CACHE)
+            if nhan_ktt and not DUNG.is_set():
                 ktt = [r for r in kq if str(r["tinh_trang"]).startswith("KHÔNG TÌM")]
                 da_khop = {os.path.dirname(x) for r in kq if r["tinh_trang"] == "KHỚP" for x in (r["file_word"], r["file_pdf"]) if x}
-                ds = [f for f in loc_files(files, v_tmc.get(), v_nam3.get()) if os.path.dirname(f["path"]) not in da_khop]
+                ds = [f for f in files if os.path.dirname(f["path"]) not in da_khop]
                 n_doc = sum(f["dinh_dang"] in DOC_DUOC for f in ds)
                 uoc = n_doc * GIAY_MOI_FILE
                 log(f"KHÔNG TÌM THẤY: {len(ktt)} dòng, quét lời nói đầu {n_doc} file PDF/DOCX, ước tính lần đầu ~{_gio(uoc)} "
                     "(file đã có trong cache nhanh hơn nhiều)")
                 if uoc > 1800 and not hoi(
                         f"Quét lời nói đầu {n_doc} file PDF/DOCX ước tính mất khoảng {_gio(uoc)} (ổ cục bộ; ổ mạng có thể lâu hơn).\n\n"
-                        "Nên giới hạn theo thư mục con hoặc năm Date Modified ở tab 3 rồi chạy từng phần.\n\nVẫn chạy toàn bộ?"):
+                        "Có thể bấm ■ Dừng bất cứ lúc nào: phần đã đọc được lưu cache, chạy lại sẽ làm tiếp.\n\nVẫn chạy?"):
                     log("  Bỏ qua bước quét lời nói đầu.")
                 else:
                     t0 = time.time()
+                    bao(nhan_ktt, 0, len(ds))
                     def prog(i):
-                        log(f"  {i}/{len(ds)} file - còn khoảng {_gio((time.time() - t0) / i * (len(ds) - i))}")
-                        if i % 1000 == 0: ghi_cache(cache, cache_p)
+                        bao(nhan_ktt, i, len(ds))
+                        if i % 200 == 0:
+                            log(f"  {i}/{len(ds)} file - còn khoảng {_gio((time.time() - t0) / i * (len(ds) - i))}")
+                        if i % 1000 == 0: ghi_cache(cache, CACHE)
                     try:
                         xu_ly_khong_tim_thay(ktt, ds, cache, prog)
                     except DaDung:
                         pass
         finally:
-            ghi_cache(cache, cache_p); dong_word()
+            ghi_cache(cache, CACHE); dong_word(); cache.dong()
         if DUNG.is_set():
             log("ĐÃ DỪNG theo yêu cầu - ghi kết quả phần đã làm; chạy lại sẽ dùng cache, làm tiếp nhanh.")
         DUNG.clear()  # ghi kết quả cho xong dù đã bấm Dừng
-        dem = defaultdict(int)
-        for r in kq: dem[r["tinh_trang"]] += 1
-        for k, v in dem.items(): log(f"  {k}: {v}")
-        tm = doi_chieu_thu_muc(kq, files, cache); cache.dong()
-        for k, v in Counter(x["tinh_trang"] for x in tm).items(): log(f"  Thư mục kho - {k}: {v}")
-        ra1, ra2 = ghi_ket_qua(kq, xl, ra, tm)
-        ui(v_dc4.set, ra1)
-        log(f"Kết quả: {ra1}\nExcel đánh dấu: {ra2}")
-    b3 = ttk.Button(t3, text="Kiểm tra", command=lambda: chay(b3, kiem_tra_gui, tt3)); b3.grid(row=8, column=1, sticky="w", pady=6)
+        log("Kết quả: " + ", ".join(f"{k}: {v}" for k, v in Counter(r["tinh_trang"] for r in kq).items()))
 
-    # --- tab 4: đổi tên & lưu ---
-    t4 = ttk.Frame(nb, padding=10); nb.add(t4, text="4. Đổi tên & lưu")
-    v_dc4, v_xl4, v_move = tk.StringVar(value=moi_nhat(DC2, DC3)), tk.StringVar(), tk.BooleanVar()
-    v_dich, v_ra4 = tk.StringVar(value=TM["sach_da_luu"]), tk.StringVar(value=TM["4_doi_ten"])
+    def buoc_ghi(kq, files, xl, ra, log, bao):
+        """Sheet thư mục kho + danh sách cần OCR (từ cache) -> doi_chieu_*.xlsx và Excel tổng hợp đánh dấu (KHỚP tô vàng)."""
+        bao("Lập sheet thư mục kho và danh sách cần OCR")
+        cache = doc_cache(CACHE)
+        tm, ocr = doi_chieu_thu_muc(kq, files, cache), ds_can_ocr(kq, files, cache); cache.dong()
+        for k, v in Counter(x["tinh_trang"] for x in tm).items(): log(f"  Thư mục kho - {k}: {v}")
+        if ocr:
+            log(f"  Cần OCR: {len(ocr)} file PDF không có lớp chữ (scan / chữ dạng hình vẽ) - danh sách ở sheet CAN_OCR")
+        bao("Ghi file kết quả")
+        ra1, ra2 = ghi_ket_qua(kq, xl, ra, tm, ocr)
+        log(f"File kết quả: {ra1}\nExcel tổng hợp đánh dấu (dòng KHỚP tô vàng): {ra2}")
+        ui(v_dc4.set, ra1)  # tab đổi tên & lưu lấy luôn kết quả mới
+        return ra1
+
+    def khop_ten(xl, kho, log, bao, nhan):
+        """Đọc Excel tổng hợp + file kho, khớp tên sách -> (kq, files)."""
+        bao("Đọc file Excel tổng hợp")
+        sach = doc_excel(xl); log(f"Excel tổng hợp: {len(sach)} đầu sách")
+        # mã BBT quy định: cạnh Excel tổng hợp, cạnh exe hoặc thư mục cha; đọc lại mỗi lần chạy (sửa file không cần mở lại tool)
+        f = next((p for d in (os.path.dirname(xl), noi, os.path.dirname(noi)) for p in [os.path.join(d, XL_MA_BBT)] if os.path.isfile(p)), "")
+        MA_BBT.clear(); MA_BBT.update(doc_ma_bbt(f) if f else {})
+        log(f"Mã BBT: {len(MA_BBT)} mã quy định từ {f}" if MA_BBT else
+            f"Mã BBT: chưa có mã quy định ({XL_MA_BBT} {'chưa điền cột F' if f else 'không thấy'}) - dùng BBT bỏ dấu")
+        bao(nhan)
+        files = doc_kho(kho); kq = doi_chieu(sach, files)
+        log(f"Khớp tên: {len(files)} file kho - " + ", ".join(f"{k}: {v}" for k, v in Counter(r["tinh_trang"] for r in kq).items()))
+        return kq, files
+
+    NHAN_LECH, NHAN_KTT = "Năm xuất bản (LỆCH NĂM)", "Lời nói đầu (KHÔNG TÌM THẤY)"
+    o_excel = []  # các ô "File Excel tổng hợp": tab đổi tên để trống thì lấy ô đã điền ở tab trước
+
+    def hai_hop_kiem(parent, dong):
+        v_lech, v_ktt = tk.BooleanVar(value=True), tk.BooleanVar(value=True)
+        ttk.Checkbutton(parent, text="Kiểm tra nội dung sách LỆCH NĂM (đọc năm xuất bản ở trang cuối / 8 trang đầu)", variable=v_lech)\
+            .grid(row=dong, column=0, columnspan=3, sticky="w")
+        ttk.Checkbutton(parent, text="Tìm sách KHÔNG TÌM THẤY theo lời nói đầu (đọc các file còn lại trong kho - lâu)", variable=v_ktt)\
+            .grid(row=dong + 1, column=0, columnspan=3, sticky="w")
+        return v_lech, v_ktt
+
+    if so_tab == 2:
+        # --- tab 1: đối chiếu = quét kho -> khớp tên sách -> kiểm tra nội dung -> ghi kết quả ---
+        t1 = ttk.Frame(nb, padding=10); nb.add(t1, text="1. Đối chiếu")
+        v_tm, v_ext, v_kho, v_xl = tk.StringVar(), tk.StringVar(value=EXT_MAC_DINH), tk.StringVar(), tk.StringVar(value=XL_MD)
+        v_ra = tk.StringVar(value=TM["2_doi_chieu"]); o_excel.append(v_xl)
+        hang(t1, 0, "Thư mục kho", v_tm, filedialog.askdirectory)
+        hang(t1, 1, "Định dạng (cách)", v_ext)
+        hang(t1, 2, "File kho có sẵn", v_kho, chon_csv)
+        ttk.Label(t1, text="(để trống = quét kho mới; chọn file kho_*.xlsx đã quét để bỏ qua bước quét)").grid(row=3, column=1, sticky="w")
+        hang(t1, 4, "File Excel tổng hợp", v_xl, chon_xlsx)
+        hang(t1, 5, "Thư mục kết quả", v_ra, filedialog.askdirectory)
+        v_lech, v_ktt = hai_hop_kiem(t1, 6)
+        pb1, lb1, tt1 = khung(t1, 9)
+
+        def doi_chieu_2tab():
+            xl, ra, kho = v_xl.get(), v_ra.get() or TM["2_doi_chieu"], v_kho.get().strip()
+            if not os.path.isfile(xl): raise ValueError("Chưa chọn file Excel tổng hợp")
+            if kho and not os.path.isfile(kho): raise ValueError(f"Không tìm thấy file kho có sẵn: {kho}")
+            if not kho and not os.path.isdir(v_tm.get()): raise ValueError("Chưa chọn thư mục kho (hoặc file kho có sẵn)")
+            log, (bao, het), T0 = logger(tt1), tien_do(pb1, lb1), time.time()
+            buoc = ([] if kho else ["Quét kho"]) + ["Khớp tên sách"] + [b for b, chon in (
+                (NHAN_LECH, v_lech.get()), (NHAN_KTT, v_ktt.get())) if chon]
+            ten = lambda b: f"Bước {buoc.index(b) + 1}/{len(buoc)} - {b}" if b in buoc else ""
+            doc_excel(xl)  # sai file Excel thì báo ngay, trước khi quét kho lâu
+            if not kho:
+                kho = buoc_quet(v_tm.get(), v_ext.get().split(), log, bao, ten("Quét kho"))
+                log("  (lần sau muốn bỏ qua bước quét: chọn file kho này ở ô 'File kho có sẵn')")
+            kq, files = khop_ten(xl, kho, log, bao, ten("Khớp tên sách"))
+            buoc_noi_dung(kq, files, ten(NHAN_LECH), ten(NHAN_KTT), log, bao)
+            buoc_ghi(kq, files, xl, ra, log, bao)
+            het(f"Xong - tổng thời gian {_gio(time.time() - T0)}")
+        b1 = ttk.Button(t1, text="Chạy đối chiếu", command=lambda: chay(b1, bat(pb1, doi_chieu_2tab), tt1))
+        b1.grid(row=8, column=1, sticky="w", pady=6)
+    else:
+        # --- tab 1: quét kho ---
+        t1 = ttk.Frame(nb, padding=10); nb.add(t1, text="1. Quét kho")
+        v_tm, v_ext = tk.StringVar(), tk.StringVar(value=EXT_MAC_DINH)
+        hang(t1, 0, "Thư mục kho", v_tm, filedialog.askdirectory)
+        hang(t1, 1, "Định dạng (cách)", v_ext)
+        pb1, lb1, tt1 = khung(t1, 3)
+
+        def quet_4tab():
+            if not os.path.isdir(v_tm.get()): raise ValueError("Chưa chọn thư mục kho")
+            log, (bao, het), T0 = logger(tt1), tien_do(pb1, lb1), time.time()
+            kho = buoc_quet(v_tm.get(), v_ext.get().split(), log, bao, "Quét kho")
+            ui(v_kho2.set, kho); ui(v_kho3.set, kho)  # tab 2, 3 lấy luôn file kho mới
+            het(f"Xong - tổng thời gian {_gio(time.time() - T0)}")
+        b1 = ttk.Button(t1, text="Quét", command=lambda: chay(b1, bat(pb1, quet_4tab), tt1)); b1.grid(row=2, column=1, sticky="w", pady=6)
+
+        # --- tab 2: đối chiếu Excel (khớp tên sách) ---
+        t2 = ttk.Frame(nb, padding=10); nb.add(t2, text="2. Đối chiếu Excel")
+        v_xl2, v_kho2, v_ra2 = tk.StringVar(value=XL_MD), tk.StringVar(value=moi_nhat(*KHO)), tk.StringVar(value=TM["2_doi_chieu"])
+        o_excel.append(v_xl2)
+        hang(t2, 0, "File Excel tổng hợp", v_xl2, chon_xlsx)
+        hang(t2, 1, "File kho (xlsx)", v_kho2, chon_csv)
+        hang(t2, 2, "Thư mục kết quả", v_ra2, filedialog.askdirectory)
+        pb2, lb2, tt2 = khung(t2, 4)
+
+        def khop_4tab():
+            xl, kho = v_xl2.get(), v_kho2.get()
+            if not os.path.isfile(xl): raise ValueError("Chưa chọn file Excel tổng hợp")
+            if not os.path.isfile(kho): raise ValueError("Chưa chọn file kho")
+            log, (bao, het), T0 = logger(tt2), tien_do(pb2, lb2), time.time()
+            kq, files = khop_ten(xl, kho, log, bao, "Khớp tên sách")
+            ra1 = buoc_ghi(kq, files, xl, v_ra2.get() or TM["2_doi_chieu"], log, bao)
+            ui(v_dc3.set, ra1)
+            het(f"Xong - tổng thời gian {_gio(time.time() - T0)}")
+        b2 = ttk.Button(t2, text="Đối chiếu", command=lambda: chay(b2, bat(pb2, khop_4tab), tt2)); b2.grid(row=3, column=1, sticky="w", pady=6)
+
+        # --- tab 3: kiểm tra nội dung ---
+        t3 = ttk.Frame(nb, padding=10); nb.add(t3, text="3. Kiểm tra nội dung")
+        v_dc3, v_xl3 = tk.StringVar(value=moi_nhat(*DC)), tk.StringVar(value=XL_MD)
+        v_kho3, v_ra3 = tk.StringVar(value=moi_nhat(*KHO)), tk.StringVar(value=TM["2_doi_chieu"])
+        o_excel.append(v_xl3)
+        hang(t3, 0, "File doi_chieu_*.xlsx", v_dc3, chon_xlsx)
+        hang(t3, 1, "File Excel tổng hợp", v_xl3, chon_xlsx)
+        hang(t3, 2, "File kho (xlsx)", v_kho3, chon_csv)
+        hang(t3, 3, "Thư mục kết quả", v_ra3, filedialog.askdirectory)
+        v_lech, v_ktt = hai_hop_kiem(t3, 4)
+        pb3, lb3, tt3 = khung(t3, 7)
+
+        def kiem_4tab():
+            dc, xl, kho = v_dc3.get(), v_xl3.get() or v_xl2.get(), v_kho3.get() or v_kho2.get()
+            for p, m in ((dc, "file doi_chieu"), (xl, "file Excel tổng hợp"), (kho, "file kho")):
+                if not os.path.isfile(p): raise ValueError(f"Chưa chọn {m}")
+            log, (bao, het), T0 = logger(tt3), tien_do(pb3, lb3), time.time()
+            buoc = [b for b, chon in ((NHAN_LECH, v_lech.get()), (NHAN_KTT, v_ktt.get())) if chon]
+            ten = lambda b: f"Bước {buoc.index(b) + 1}/{len(buoc)} - {b}" if b in buoc else ""
+            bao("Đọc file đối chiếu và file kho")
+            kq, files = doc_doi_chieu(dc), doc_kho(kho)
+            log(f"{len(kq)} dòng sách, {len(files)} file kho")
+            buoc_noi_dung(kq, files, ten(NHAN_LECH), ten(NHAN_KTT), log, bao)
+            buoc_ghi(kq, files, xl, v_ra3.get() or TM["2_doi_chieu"], log, bao)
+            het(f"Xong - tổng thời gian {_gio(time.time() - T0)}")
+        b3 = ttk.Button(t3, text="Kiểm tra", command=lambda: chay(b3, bat(pb3, kiem_4tab), tt3)); b3.grid(row=6, column=1, sticky="w", pady=6)
+
+    # --- tab cuối: đổi tên & lưu (giống nhau ở cả hai bản) ---
+    t4 = ttk.Frame(nb, padding=10); nb.add(t4, text=f"{so_tab}. Đổi tên & lưu")
+    v_dc4, v_xl4, v_move = tk.StringVar(value=moi_nhat(*DC)), tk.StringVar(value=XL_MD), tk.BooleanVar()
+    v_dich, v_ra4 = tk.StringVar(value=TM["sach_da_luu"]), tk.StringVar(value=TM["3_doi_ten"])
     hang(t4, 0, "File doi_chieu_*.xlsx", v_dc4, chon_xlsx)
     hang(t4, 1, "File Excel tổng hợp", v_xl4, chon_xlsx)
     hang(t4, 2, "Thư mục đích", v_dich, filedialog.askdirectory)
     hang(t4, 3, "Thư mục kết quả", v_ra4, filedialog.askdirectory)
     ttk.Checkbutton(t4, text="Di chuyển file (mặc định: copy)", variable=v_move).grid(row=4, column=0, columnspan=3, sticky="w")
-    tt4 = tk.Text(t4, height=10, wrap="none"); tt4.grid(row=6, column=0, columnspan=3, sticky="we", pady=8)
+    pb4, lb4, tt4 = khung(t4, 6)
+    tt4.config(wrap="none")
+    dl = lambda b: f"{b / 2**20:.0f} MB" if b < 2**30 else f"{b / 2**30:.2f} GB"
 
-    def luu_gui(thu):
-        xl, ra = v_xl4.get() or v_xl3.get() or v_xl.get(), v_ra4.get() or v_ra3.get() or v_ra.get()
+    def luu(thu):
+        xl = v_xl4.get() or next((v.get() for v in o_excel if v.get()), "")
+        ra = v_ra4.get() or TM["3_doi_ten"]
         if not os.path.isfile(v_dc4.get()): raise ValueError("Chưa chọn file doi_chieu")
         if not os.path.isdir(v_dich.get()): raise ValueError("Chưa chọn thư mục đích")
         if not thu and not os.path.isfile(xl): raise ValueError("Chưa chọn file Excel tổng hợp")
-        log = logger(tt4)
+        log, (bao, het), T0 = logger(tt4), tien_do(pb4, lb4), time.time()
+        bao("Đọc file đối chiếu, lập danh sách file cần chép")
         kq = doc_doi_chieu(v_dc4.get()); kh = ke_hoach_luu(kq, v_dich.get())
-        log(f"{len(kh)} file sẽ {'di chuyển' if v_move.get() else 'copy'} sang {v_dich.get()}")
+        so_co = sum(da_co(s, p) for _, s, p in kh)
+        so_bia = sum(os.path.basename(os.path.dirname(p)) == "Bia" for _, _, p in kh)
+        log(f"{len(kh)} file sang {v_dich.get()} ({so_bia} file bìa vào thư mục Bia): "
+            f"{len(kh) - so_co} cần {'di chuyển' if v_move.get() else 'chép'}, {so_co} đã có sẵn")
         if thu:
             log("\n".join(f"{s}\n   → {p}{'   (đã có - bỏ qua)' if da_co(s, p) else ''}" for _, s, p in kh)
                 + "\n(chạy thử - chưa copy)")
+            het(f"Chạy thử xong - {len(kh)} file, chưa chép file nào")
             return
-        t0 = time.time()
-        chep, co_san, loi = luu_file(kh, v_move.get(), lambda i: log(f"  {i}/{len(kh)} - còn khoảng {_gio((time.time() - t0) / i * (len(kh) - i))}"))
+        buoc = "Di chuyển file" if v_move.get() else "Chép file"
+        def prog(i, xb, tb):
+            hien = f"{i}/{len(kh)} file, {dl(xb)}/{dl(tb)}"
+            bao(buoc, xb, tb, hien) if tb else bao(buoc, i, len(kh), hien)  # tiến độ, thời gian còn lại theo dung lượng
+            if i % 100 == 0:
+                log(f"  {hien}")
+        chep, co_san, loi = luu_file(kh, v_move.get(), prog)
         if DUNG.is_set():
             log(f"ĐÃ DỪNG theo yêu cầu sau {chep + co_san + len(loi)}/{len(kh)} file - chạy lại sẽ bỏ qua file đã chép, làm tiếp phần còn lại.")
-        ra1, ra2 = ghi_ket_qua(kq, xl, ra, doc_thu_muc(v_dc4.get()))
+        bao("Ghi file kết quả")
+        ra1, ra2 = ghi_ket_qua(kq, xl, ra, doc_thu_muc(v_dc4.get()), doc_can_ocr(v_dc4.get()))
         log(f"Xong: chép {chep} file, {co_san} file đã có sẵn (bỏ qua), {len(loi)} lỗi."
             + "".join(f"\n  LỖI {x}" for x in loi[:50]) + f"\nKết quả: {ra1}\nExcel đánh dấu: {ra2}")
-    b4a = ttk.Button(t4, text="Chạy thử", command=lambda: chay(b4a, lambda: luu_gui(True), tt4)); b4a.grid(row=5, column=1, sticky="w", pady=6)
-    b4b = ttk.Button(t4, text="Thực hiện", command=lambda: chay(b4b, lambda: luu_gui(False), tt4)); b4b.grid(row=5, column=1, sticky="e", pady=6)
+        het(f"Xong - {'di chuyển' if v_move.get() else 'chép'} {chep} file, {co_san} file đã có sẵn, {len(loi)} lỗi - tổng thời gian {_gio(time.time() - T0)}")
+    b4a = ttk.Button(t4, text="Chạy thử", command=lambda: chay(b4a, bat(pb4, lambda: luu(True)), tt4)); b4a.grid(row=5, column=1, sticky="w", pady=6)
+    b4b = ttk.Button(t4, text="Thực hiện", command=lambda: chay(b4b, bat(pb4, lambda: luu(False)), tt4)); b4b.grid(row=5, column=1, sticky="e", pady=6)
 
     root.mainloop()
 
@@ -1118,6 +1558,20 @@ def _test():
     assert ma_lan_xb(2) == "T02" and ma_lan_xb("Lần 3") == "T03" and ma_lan_xb("TB lần 2") == "T02"
     assert ten_file_moi("Tên sách", "1/2021", "PL", "TB") == "ten_sach_0121_R_PL_T01"
     assert ten_file_moi("Tên sách", None, "Đ", None) == "ten_sach_R_D_M00"
+    # mã BBT quy định (BBT_distinct.xlsx cột F): theo đúng giá trị cột J, ô trống = '(trống)', chưa điền thì giữ BBT bỏ dấu
+    import openpyxl
+    wbm = openpyxl.Workbook(); wsm = wbm.active
+    for r in (["STT", "BBT", "Mã", "Số", "Năm", "Mã quy định"], [1, "Đảng", "DANG", 1, "", "Đ"], [2, "(trống)", "XX", 1, "", "kxd"],
+              [3, "PL", "PL", 1, "", None], [4, "Vụ KH", "VUKH", 1, "", "vụ-kh 2"], [5, 0, "0", 1, "", 0], [6, "KT", "KT", 1, "", 5]):
+        wsm.append(r)
+    fm = os.path.join(tempfile.gettempdir(), "sxb_test_ma_bbt.xlsx"); wbm.save(fm)
+    assert doc_ma_bbt(fm) == {"Đảng": "D", "(trống)": "KXD", "Vụ KH": "VUKH2", "0": "00", "KT": "05"}
+    MA_BBT.update(doc_ma_bbt(fm)); os.remove(fm)
+    try:
+        assert [ten_file_moi("Sách", None, b, None) for b in ("Đảng", None, "PL", " Vụ KH ")] == \
+            ["sach_R_D_M00", "sach_R_KXD_M00", "sach_R_PL_M00", "sach_R_VUKH2_M00"]
+    finally:
+        MA_BBT.clear()
     dai = ten_file_moi("Cuốn sách " + "rất dài " * 40, "01/2021", "PL", "TB")
     assert dai.endswith("_0121_R_PL_T01") and len(dai) <= DAI_TEN + 15 and "__" not in dai and dai.startswith("cuon_sach_rat_dai")
     assert thang_qdxb("05/2023") == "05" and thang_qdxb("19/01/2007") == "01" and thang_qdxb(None) == "00"
@@ -1162,6 +1616,41 @@ def _test():
     assert kq[1]["tinh_trang"].startswith("LỆCH NĂM") and kq[1]["kieu_khop"] == "chứa tên"
     assert kq[2]["tinh_trang"] == "KHÔNG TÌM THẤY FILE"
 
+    # --- quét tiếp sau khi tool tắt giữa chừng: thư mục đã ghi xong không quét lại, thư mục đang dở quét lại ---
+    with tempfile.TemporaryDirectory() as td:
+        k = os.path.join(td, "kho"); a1, a2 = os.path.join(k, "a"), os.path.join(k, "b")
+        for d in (a1, a2):
+            os.makedirs(d); open(os.path.join(d, "x.pdf"), "w").close(); open(os.path.join(d, "y.pdf"), "w").close()
+        nk, ra = os.path.join(td, "nk.csv"), os.path.join(td, "kho.xlsx")
+        with open(nk, "w", encoding="utf-8", newline="") as f:  # giả lập: thư mục a xong (kích thước giả 7777), thư mục b dở
+            w = csv.writer(f); w.writerow(["#", os.path.abspath(k), ".pdf"])
+            w.writerow(["F", "x", "PDF", "1600000000", "7777", os.path.join(a1, "x.pdf")])
+            w.writerow(["F", "y", "PDF", "1600000000", "7777", os.path.join(a1, "y.pdf")]); w.writerow(["D", a1])
+            w.writerow(["F", "x", "PDF", "1600000000", "7777", os.path.join(a2, "x.pdf")]); f.write('F,y,PDF,16000')  # dòng ghi dở
+        bc = {}
+        assert quet(k, [".pdf"], ra, bao_cao=bc, nhat_ky=nk) == 4 and bc["tiep"] == 2 and not os.path.exists(nk)
+        fs = doc_kho(ra)
+        assert sorted(os.path.basename(os.path.dirname(f["path"])) for f in fs) == ["a", "a", "b", "b"]
+        assert openpyxl.load_workbook(ra)["Kho"]["F2"].value == 8  # thư mục a lấy từ nhật ký (7777 byte), không quét lại
+        nk2 = os.path.join(td, "nk2.csv")
+        with open(nk2, "w", encoding="utf-8", newline="") as f:
+            csv.writer(f).writerow(["#", "C:\\khac", ".pdf"])
+        try:
+            quet(k, [".pdf"], ra, nhat_ky=nk2); assert False
+        except ValueError as e:
+            assert "thư mục/định dạng khác" in str(e)
+        # cache: dấu 'đang đọc' của tiến trình đã chết = file làm tool tắt -> lần sau bỏ qua
+        cp = os.path.join(td, "c.sqlite"); c = doc_cache(cp)
+        c.db.execute("insert into dang_doc values (?, ?, ?)", (4000000, "k1", "C:\\hong.pdf"))  # pid không tồn tại
+        c.db.execute("insert into dang_doc values (?, ?, ?)", (os.getpid(), "k2", "C:\\dang.pdf")); c.dong()  # chính mình
+        c = doc_cache(cp)
+        assert c.vua_loi == ["C:\\hong.pdf"] and c["k1"] is None and "k2" not in c
+        assert c.db.execute("select path from file_loi").fetchall() == [("C:\\hong.pdf",)]
+        assert c.doc("k3", "C:\\tot.pdf", lambda: {"nam": []}) == {"nam": []}
+        assert c.db.execute("select count(*) from dang_doc where pid = ?", (os.getpid(),)).fetchone()[0] == 0
+        c.db.execute("delete from dang_doc"); c.dong()
+        c = doc_cache(cp); assert c.vua_loi == []; c.dong()
+
     # --- ô Excel 32.767 ký tự, thứ tự danh sách file, định dạng thời gian ---
     dai = _ds_file((f"2021-01-01 00:00:00", f"C:\\kho\\{i:06d}" + (".jpg" if i % 2 else ".pdf")) for i in range(2000))
     o = _cell(dai)
@@ -1197,15 +1686,27 @@ def _test():
     assert key_thu_muc(os.path.dirname(files[3]["path"])) == ["k", "den xanh den do", "in"]
     assert key_thu_muc(os.path.dirname(files[4]["path"])) == ["k", "den xanh den do"] and "ten_file" not in files[0]
     kq = doi_chieu([dict(nam=2021, dong=2, tt=1, ten="Đèn xanh, đèn đỏ", lan="TB", bbt="QT", qdxb="03/2021"),
-                    dict(nam=2021, dong=3, tt=2, ten="Đối ngoại quốc phòng (Sách chuyên khảo)", lan=None, bbt="QT", qdxb=None),
+                    dict(nam=2021, dong=3, tt=2, ten="Đối ngoại quốc phòng Việt Nam trong thời kỳ mới", lan=None, bbt="QT", qdxb=None),
                     dict(nam=2021, dong=4, tt=3, ten="Đèn xanh, đè", lan=None, bbt="QT", qdxb=None)], files)
     assert kq[0]["kieu_khop"] == "chính xác" and kq[0]["so_file"] == 5 and kq[0]["tinh_trang"] == "KHỚP"
     assert kq[0]["file_word"].endswith(".doc") and kq[0]["file_pdf"].endswith("DEN XANH (TB).pdf")
     assert kq[0]["ghi_chu"] == "1 file khác năm bị bỏ qua; bỏ 2 file bìa/tờ che"
     assert kq[1]["kieu_khop"] == "thư mục rút gọn" and kq[1]["file_pdf"].endswith("doi ngoai.pdf")
     kq2 = doi_chieu([dict(nam=2021, dong=2, tt=1, ten="Đối ngoại quốc phòng", lan=None, bbt="QT", qdxb=None),
-                     dict(nam=2021, dong=3, tt=2, ten="Đối ngoại quốc phòng (Sách chuyên khảo)", lan=None, bbt="QT", qdxb=None)], files)
+                     dict(nam=2021, dong=3, tt=2, ten="Đối ngoại quốc phòng Việt Nam trong thời kỳ mới", lan=None, bbt="QT", qdxb=None),
+                     dict(nam=2021, dong=4, tt=3, ten="Đối ngoại quốc phòng (Sách chuyên khảo)", lan=None, bbt="QT", qdxb=None)], files)
     assert kq2[0]["kieu_khop"] == "chính xác" and kq2[1]["so_file"] == 0  # đã có sách trùng tên thư mục -> không khớp rút gọn
+    assert kq2[2]["kieu_khop"] == "chính xác" and kq2[2]["tinh_trang"] == "KHỚP"  # bỏ chú thích 'Sách chuyên khảo' khi khớp
+    # chú thích sau tên sách không chặn khớp tên -> file Date Modified 2018 khớp ngay dòng 2018, dòng 2009 lệch năm
+    assert loi_ten("Ngoại giao và công tác ngoại giao Sách chuyên khảo (Xuất bản lần thứ hai, có sửa chữa)") == "ngoai giao va cong tac ngoai giao"
+    assert loi_ten("Chơi đến cùng (Sách tham khảo) Người dịch: Đinh Trọng Minh") == "choi den cung"
+    assert loi_ten("Ngoại giao và công tác ngoại giao (Tiếng Lào)").endswith("tieng lao") and loi_ten("Tái bản") == "tai ban"
+    ng = [dict(nam=2009, dong=5, tt=1, ten="Ngoại giao và công tác ngoại giao", lan=None, bbt="QT", qdxb="06/2009"),
+          dict(nam=2018, dong=6, tt=1, ten="Ngoại giao và công tác ngoại giao Sách chuyên khảo (Xuất bản lần thứ hai)", lan="2", bbt="QT", qdxb="10/2018")]
+    fng = [dict(key=chuan_hoa("Ngoại giao và công tác ngoại giao"), dinh_dang="pdf", date_modified="2018-10-20 09:00:00",
+                path=r"K\ng\Ngoại giao và công tác ngoại giao.pdf", nam=2018)]
+    kng = doi_chieu(ng, fng)
+    assert [r["tinh_trang"][:8] for r in kng] == ["LỆCH NĂM", "KHỚP"] and file_theo_dm(kng) == {fng[0]["path"]: 2018}
     assert kq[2]["tinh_trang"] == "KHÔNG TÌM THẤY FILE"  # "den xanh de" chỉ khớp ký tự, không khớp nguyên từ
     assert nam_trang_cuoi("nghi quyet so 41 2017 qh14 bo luat so 100 2015 qh13 in xong va nop luu chieu thang nam 2021") == [2021]
     assert nam_trang_cuoi("in xong va noap lou chieau thaung 3 naem 2021 chiu") == [2021]
@@ -1217,6 +1718,10 @@ def _test():
     assert nam_trang_dau("gioi thieu cuon sach cung ban doc thang 4 nam 2021 nhj xuat ban nam 2004 2012") == [2021]
     assert nam_trang_dau("so dang ky ke hoach xuat ban 4139 2020 cxbiph nop luu chieu thang 10 nam 2020" + " x" * 200 + " 1900 2019") == [2020]
     assert nam_trang_dau("nghi quyet so 133 2020 qh14 ngay 17 11 2020") == []
+    assert nam_trang_dau_bac("gioi thieu cung ban doc thang 6 nam 2009 nha xuat ban") == ([2009], 3)
+    assert khop_nam(dict(nam=[2018], dau=[2009], dau_bac=3), 2009) == ""  # tái bản giữ lời NXB 2009, trang cuối ghi 2018
+    assert khop_nam(dict(nam=[], dau=[2019], dau_bac=3), 2019) == "8 trang đầu"  # trang cuối không có năm -> vẫn dùng
+    assert khop_nam(dict(nam=[2020], dau=[2021], dau_bac=2), 2021) == "8 trang đầu"  # CIP đầu sách vẫn thắng
     assert nam_trang_dau("van kien nxb chinh tri quoc gia ha noi 2011 t 7 tr 15") == []  # chú thích tài liệu tham khảo
     assert nam_trang_dau("nop luu chieu thang 4 nam 2021 ma isbn 978 bien muc h chinh tri quoc gia 2020 72tr") == [2021]
     assert nam_trang_dau("h chinh tri quoc gia 2021 244tr gioi thieu cung ban doc thang 11 nam 2019 nha xuat ban") == [2021]
@@ -1299,6 +1804,11 @@ def _test():
         assert rh["tinh_trang"] == "KHỚP" and rh["ghi_chu"] == f"khớp theo nội dung ({nguon})"
     rh = dict(r, nam=2015, tinh_trang="LỆCH NĂM", cac_file="2021-01-01 00:00:00  " + hai); xu_ly_lech_nam(rh, cache)
     assert rh["tinh_trang"] == "LỆCH NĂM" and "thấy: 2020, 2021" in rh["ghi_chu"]  # năm trong nội dung không tính
+    # file đã thuộc sách năm 2020 theo Date Modified -> dòng 2021 không đọc lại nội dung file đó
+    rh = dict(r, nam=2021, tinh_trang="LỆCH NĂM", cac_file="2020-06-01 00:00:00  " + hai); xu_ly_lech_nam(rh, cache, {hai: 2020})
+    assert rh["tinh_trang"] == "LỆCH NĂM" and "h.pdf đã thuộc sách năm 2020 theo Date Modified" in rh["ghi_chu"]
+    rh = dict(r, nam=2015, tinh_trang="LỆCH NĂM", cac_file="2021-01-01 00:00:00  " + hai); xu_ly_lech_nam(rh, cache)
+    assert rh["tinh_trang"] == "LỆCH NĂM" and "thấy: 2020, 2021" in rh["ghi_chu"]  # năm trong nội dung không tính
     r2 = dict(r, nam=2020, tinh_trang="LỆCH NĂM - cần mở file kiểm tra"); xu_ly_lech_nam(r2, cache)
     assert r2["tinh_trang"].startswith("LỆCH NĂM") and "thấy: 2019, 2023" in r2["ghi_chu"] and "bia.jpg" not in r2["ghi_chu"]
 
@@ -1328,6 +1838,30 @@ def _test():
     assert nhac_ten_sach("nxb xuat ban cuon sach chuyen khao luat dau tu", "luat dau tu")
     assert not nhac_ten_sach("can cu hien phap nuoc cong hoa nam 2013", "hien phap nuoc cong hoa")
 
+    # --- PDF cần OCR: ảnh scan / chữ dạng hình vẽ -> ghi chú dòng sách, sheet thư mục, sheet CAN_OCR ---
+    tm_ocr = os.path.join(tmp, "ocr"); os.makedirs(tm_ocr)
+    scan, ve, bia_scan = (os.path.join(tm_ocr, n) for n in ("s.pdf", "v.pdf", "Bia 1.pdf"))
+    for f in (scan, bia_scan):
+        d = fitz.open(); pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 20, 20)); pix.clear_with(200)
+        for _ in range(3): d.new_page().insert_image(fitz.Rect(0, 0, 200, 200), pixmap=pix)
+        d.save(f); d.close()
+    d = fitz.open()
+    for _ in range(3): d.new_page().draw_rect(fitz.Rect(10, 10, 100, 100))
+    d.save(ve); d.close()
+    assert trich(scan)["ocr"] == "scan" and trich(scan)["trang"] == 3 and trich(ve)["ocr"] == "hinh_ve" and trich(pdf)["ocr"] == ""
+    ro = dict(nam=2021, dong=9, ten="Sách scan", tinh_trang="LỆCH NĂM", file_word="", file_pdf="", ghi_chu="",
+              cac_file="\n".join(f"2021-01-01 00:00:00  {f}" for f in (scan, ve, bia_scan)))
+    xu_ly_lech_nam(ro, cache)
+    assert ro["tinh_trang"] == "LỆCH NĂM" and ro["ghi_chu"].endswith("cần OCR (PDF không có lớp chữ): s.pdf (3 trang), v.pdf (3 trang)")
+    kho_ocr = [dict(dinh_dang="pdf", path=f) for f in (scan, ve, bia_scan, pdf)]
+    ocr_ds = ds_can_ocr([ro], kho_ocr, cache)
+    assert [(x["ten_file"], x["trang"], x["ly_do"]) for x in ocr_ds] == [("s.pdf", 3, LY_DO_OCR["scan"]), ("v.pdf", 3, LY_DO_OCR["hinh_ve"])]
+    assert ocr_ds[0]["sach"] == "2021 - dòng 9 - Sách scan" and ocr_ds[0]["ten_tm"] == "ocr" and ocr_ds[0]["uu_tien"] == OCR_CAO
+    khop = dict(ro, tinh_trang="KHỚP", file_pdf=pdf, file_word="")  # thư mục khác đã khớp -> file OCR ở thư mục đó ưu tiên thấp
+    assert [x["uu_tien"] for x in ds_can_ocr([ro, dict(khop, file_pdf=scan)], kho_ocr, cache)] == [OCR_THAP, OCR_THAP]
+    g = next(x for x in doi_chieu_thu_muc([ro], kho_ocr, cache) if x["ten_tm"] == "ocr")["ghi_chu"]
+    assert "2 file PDF cần OCR (không có lớp chữ) - xem sheet CAN_OCR" in g and "không thấy năm" not in g
+
     # --- ghi / đọc lại doi_chieu, tab 4 ---
     xl = os.path.join(tmp, "th.xlsx"); wb = openpyxl.Workbook(); ws = wb.active; ws.title = "2023"
     ws.append(["TT", "Tên sách"]); ws.append([1, "Luật đầu tư"]); ws.append([2, "Không có"]); wb.save(xl)
@@ -1347,11 +1881,11 @@ def _test():
     assert [(x["ten_tm"], x["tinh_trang"], x["so_file"]) for x in tm] == [
         (os.path.basename(tmp), TM_KHOP, 2), ("x", TM_KHONG, 1), ("y", TM_CHUA, 1), ("z_trung", TM_TRUNG, 1)]
     assert tm[3]["nam_cuoi"] == "trang cuối: 2023; 8 trang đầu: 2023"
-    assert tm[0]["nam_cuoi"] == "trang cuối: 2019, 2023; 8 trang đầu: 2019, 2023" and tm[0]["ghi_chu"] == "đọc được 2/2 file Word/PDF"
-    assert tm[1]["ghi_chu"].startswith("không có file Word/PDF") and tm[2]["ghi_chu"].startswith("đọc được 0/1")
+    assert tm[0]["nam_cuoi"] == "trang cuối: 2019, 2023; 8 trang đầu: 2019, 2023" and tm[0]["ghi_chu"] == "mở được 2/2 file Word/PDF"
+    assert tm[1]["ghi_chu"].startswith("không có file Word/PDF") and tm[2]["ghi_chu"].startswith("mở được 0/1")
     assert tm[0]["loai"] == "DOCX 1, PDF 1" and tm[0]["sach_khop"] == "2023 - dòng 2 - Luật đầu tư" and tm[2]["sach_khac"].endswith("Không có")
-    ra1, ra2 = ghi_ket_qua(kq, xl, os.path.join(tmp, "ra"), tm)
-    assert doc_thu_muc(ra1) == tm
+    ra1, ra2 = ghi_ket_qua(kq, xl, os.path.join(tmp, "ra"), tm, ocr_ds)
+    assert doc_thu_muc(ra1) == tm and doc_can_ocr(ra1) == ocr_ds
     kq2 = doc_doi_chieu(ra1)
     assert [r["ten"] for r in kq2] == ["Luật đầu tư", "Không có"] and kq2[0]["file_pdf"] == pdf and kq2[0]["dong"] == 2
     kq2.append(dict(kq2[0], dong=4, qdxb=None))  # trùng tên file mới -> _2
@@ -1379,16 +1913,57 @@ def _test():
         assert not os.path.exists(os.path.join(dich, "2023", "thang 05", "sach_dung"))
     finally:
         DUNG.clear()
+    # bìa: ảnh, .ai, PDF 1-2 trang, PDF tên 'Bìa' -> <thư mục sách>/Bia/<tên _B_>; PDF 1-2 trang không làm ruột
+    assert ten_bia("luat_dau_tu_0523_R_PL_T01") == "luat_dau_tu_0523_B_PL_T01" and ten_bia("ten_R_R_M00") == "ten_B_R_M00"
+    tb = os.path.join(tmp, "co_bia"); os.makedirs(tb)
+    def lam_pdf(ten, n):
+        d = fitz.open()
+        for _ in range(n): d.new_page().insert_text((50, 72), "Noi dung")
+        d.save(os.path.join(tb, ten)); d.close(); return os.path.join(tb, ten)
+    ruot, mong, bia4 = lam_pdf("ruot.pdf", 5), lam_pdf("mong 1 trang.pdf", 1), lam_pdf("Bia 4.pdf", 3)
+    anh, ai_, bt2 = os.path.join(tb, "bia.jpg"), os.path.join(tb, "bia.ai"), os.path.join(tb, "ban thao.docx")
+    for f, nd in ((anh, b"jpg"), (ai_, b"ai"), (bt2, b"x")): open(f, "wb").write(nd)
+    ds = [("2023-02-01 00:00:00", mong), ("2023-01-01 00:00:00", ruot), ("2023-01-01 00:00:00", bia4), ("2023-01-01 00:00:00", bt2)]
+    assert chon_file(ds)[1] == ruot  # PDF 1 trang mới hơn vẫn không làm ruột
+    d = fitz.open(); pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 400, 400)); pix.clear_with(90)
+    for _ in range(3): d.new_page().insert_image(fitz.Rect(0, 0, 400, 400), pixmap=pix)
+    ban_in = os.path.join(tb, "ban in.pdf"); d.save(ban_in); d.close()
+    assert os.path.getsize(ban_in) > os.path.getsize(ruot)  # nặng hơn nhưng ít trang hơn
+    assert chon_file([("2023-01-01 00:00:00", ban_in), ("2023-01-01 00:00:00", ruot)])[1] == ruot  # cùng ngày: nhiều trang hơn
+    # trải bìa nằm ngang + 2 tai gập (3 trang) là bìa, không làm ruột
+    d = fitz.open(); d.new_page(width=1148, height=567); d.new_page(width=348, height=567); d.new_page(width=348, height=567)
+    trai = os.path.join(tb, "trai_sach.pdf"); d.save(trai); d.close()
+    assert pdf_mong(trai) and not pdf_mong(ruot)
+    assert chon_file([("2023-02-01 00:00:00", trai), ("2023-01-01 00:00:00", ruot)])[1] == ruot
+    chi_bia = dict(kq2[0], file_word="", file_pdf="", ten_moi="chi_co_bia_0523_R_PL_T01", dich="",
+                   cac_file=f"2023-02-01 00:00:00  {trai}\n2023-01-01 00:00:00  {anh}")
+    assert sorted(os.path.basename(p) for _, _, p in ke_hoach_luu([chi_bia], dich)) == ["chi_co_bia_0523_B_PL_T01.jpg", "chi_co_bia_0523_B_PL_T01.pdf"]  # chỉ có bìa: vẫn lưu bìa
+    rb = dict(kq2[0], file_word=bt2, file_pdf=ruot, ten_moi="sach_co_bia_0523_R_PL_T01", dich="",
+              cac_file="\n".join(f"2023-01-01 00:00:00  {f}" for f in (ruot, mong, bia4, anh, ai_, bt2)))
+    assert ds_bia(rb) == sorted([mong, bia4, anh, ai_])
+    khb = ke_hoach_luu([rb], dich); tmb = os.path.dirname(khb[0][2])
+    assert [os.path.relpath(p, tmb) for _, _, p in khb] == ["sach_co_bia_0523_R_PL_T01.docx", "sach_co_bia_0523_R_PL_T01.pdf",
+        os.path.join("Bia", "sach_co_bia_0523_B_PL_T01.pdf"), os.path.join("Bia", "sach_co_bia_0523_B_PL_T01.ai"),
+        os.path.join("Bia", "sach_co_bia_0523_B_PL_T01.jpg"), os.path.join("Bia", "sach_co_bia_0523_B_PL_T01_2.pdf")]
+    assert luu_file(khb) == (6, 0, []) and luu_file(ke_hoach_luu([dict(rb, dich="")], dich)) == (0, 6, [])  # chạy lại: bỏ qua
+    open(os.path.join(tmb, "Bia", "sach_co_bia_0523_B_PL_T01.png"), "wb").write(b"file khac")  # tên đã có file khác
+    png = os.path.join(tb, "bia.png"); open(png, "wb").write(b"png moi")
+    khp = ke_hoach_luu([dict(rb, dich="", cac_file=rb["cac_file"] + f"\n2023-01-01 00:00:00  {png}")], dich)
+    assert next(d for _, s, d in khp if s == png).endswith("sach_co_bia_0523_B_PL_T01_2.png")  # không ghi đè file khác
     # lỗi một file không làm dừng cả lượt
     hong = dict(kq2[0], file_word=os.path.join(tmp, "khong_co.docx"), ten_moi="sach_loi", dich="", ghi_chu="")
-    chep, co_san, loi = luu_file(ke_hoach_luu([hong, dict(kq2[0], ten_moi="sach_tot", dich="")], dich))
+    goi = []
+    chep, co_san, loi = luu_file(ke_hoach_luu([hong, dict(kq2[0], ten_moi="sach_tot", dich="")], dich), progress=lambda *a: goi.append(a))
     assert chep == 3 and len(loi) == 1 and "LỖI lưu khong_co.docx" in hong["ghi_chu"]
+    tong = os.path.getsize(pdf) * 2 + os.path.getsize(dx)  # file nguồn không tồn tại không tính vào tổng dung lượng
+    assert [a[0] for a in goi] == [1, 2, 3, 4] and goi[-1][1:] == (tong, tong) and goi[0][1] == 0
     ra1, ra2 = ghi_ket_qua(kq2, xl, os.path.join(tmp, "ra"))
     ws = openpyxl.load_workbook(ra2)["2023"]
     assert ws.cell(1, 6).value == "Đường dẫn đích" and ws.cell(2, 6).value == kq2[0]["dich"] and ws.cell(2, 3).value == "KHỚP"
+    assert all(ws.cell(2, c).fill.fgColor.rgb == "00FFFF00" for c in range(1, 7)) and ws.cell(3, 1).fill.fill_type is None  # KHỚP tô vàng
     shutil.rmtree(tmp, ignore_errors=True)
     print("OK")
 
 
 if __name__ == "__main__":
-    _test() if "--test" in sys.argv else gui()
+    _test() if "--test" in sys.argv else gui(4 if "--4tab" in sys.argv else 2)
