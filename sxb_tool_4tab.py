@@ -3,4 +3,6 @@ Dùng chung toàn bộ xử lý với sxb_tool.py (bản 2 tab). Build cả hai 
 import sys
 import sxb_tool
 
-sxb_tool._test() if "--test" in sys.argv else sxb_tool.gui(4)
+if __name__ == "__main__":
+    import multiprocessing; multiprocessing.freeze_support()  # exe: tiến trình con đọc PDF song song
+    sxb_tool._test() if "--test" in sys.argv else sxb_tool.gui(4)

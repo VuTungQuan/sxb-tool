@@ -18,6 +18,7 @@ BIA = re.compile(r"(?:^| )(bia|to che|tr ?2 4)(?= |$)")  # file bìa / tờ che 
 GIOI_HAN_O = 32000  # Excel chỉ chứa 32.767 ký tự/ô; dài hơn thì cắt theo dòng
 KY_DAU, KY_CUOI = 25000, 8000  # .doc/.docx: ~8 trang đầu, ~2-3 trang cuối tính theo số ký tự (không bắt Word dàn trang)
 GIAY_MOI_FILE = 0.25  # thời gian đọc 1 PDF/DOCX (đo trên ổ cục bộ), để ước tính trước khi quét
+SO_LUONG = max(1, (os.cpu_count() or 2) // 2)  # số tiến trình đọc PDF/DOCX song song (~ số nhân thật: Xeon 16 nhân/32 luồng -> 16)
 DUNG = threading.Event()  # nút Dừng: các vòng lặp dài kiểm tra cờ này sau mỗi file
 
 
@@ -855,12 +856,15 @@ class Cache:
         for pid, k, p in self.db.execute("select pid, k, path from dang_doc").fetchall():
             if pid == os.getpid() or _pid_song(pid):
                 continue  # đang có tiến trình khác / luồng khác đọc thật
-            self[k] = None
-            self.db.execute("insert or replace into file_loi values (?, ?, ?)",
-                            (p, "tool tắt đột ngột khi đang đọc file này", dt.datetime.now().isoformat(" ", "seconds")))
+            self.loi(k, p, "tool tắt đột ngột khi đang đọc file này")
             self.db.execute("delete from dang_doc where pid = ?", (pid,))
-            self.vua_loi.append(p)
         self.db.commit()
+
+    def loi(self, k, path, ly_do):
+        """File làm sập tool / tiến trình đọc: lưu là không đọc được (lần sau bỏ qua), ghi vào file_loi và vua_loi."""
+        self[k] = None
+        self.db.execute("insert or replace into file_loi values (?, ?, ?)", (path, ly_do, dt.datetime.now().isoformat(" ", "seconds")))
+        self.vua_loi.append(path)
 
     def doc(self, k, path, ham):
         """Đọc 1 file: ghi dấu 'đang đọc' xuống đĩa, đọc, lưu kết quả, xoá dấu."""
@@ -928,6 +932,69 @@ def trich_cache(cache, path):
         else:
             v = cache[k] = trich(path)
     return v
+
+
+def doc_truoc(cache, paths, so_luong=SO_LUONG, progress=None, ham=trich):
+    """Đọc trước song song (so_luong tiến trình con) các file PDF/DOCX chưa có trong cache (Cache), lưu vào cache để
+    các bước sau lấy ra ngay. .doc phải đọc qua Word nên vẫn đọc lần lượt ở bước sau.
+    Tiến trình con sập (PDF hỏng làm thư viện đọc PDF sập) không làm tắt tool, chỉ làm hỏng các file đang chờ trong lượt đó:
+    đọc lại từng file này trong tiến trình riêng, file nào làm sập lần nữa thì cache.loi() và coi là không đọc được.
+    progress(xong, tong). Bấm Dừng: DaDung, phần đã đọc giữ trong cache. -> số file đã đọc."""
+    from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+    from concurrent.futures.process import BrokenProcessPool
+    viec = {}
+    for p in paths:
+        k = p.lower().endswith((".pdf", ".docx")) and _khoa_cache(p)
+        if k and k not in viec and k not in cache:
+            viec[k] = p
+    con, nghi, tong, xong = list(viec.items())[::-1], [], len(viec), 0
+
+    def ghi(kp, v):
+        nonlocal xong
+        cache[kp[0]] = v; xong += 1
+        if xong % 200 == 0:
+            cache.db.commit()
+        if progress:
+            progress(xong, tong)
+
+    # ponytail: không có thời hạn cho từng file - một PDF làm thư viện treo hẳn (hiếm) sẽ giữ một tiến trình tới khi bấm Dừng
+    while con:
+        ex, dang, hong = ProcessPoolExecutor(so_luong), {}, False
+        try:
+            while dang or (con and not hong):
+                while con and not hong and len(dang) < so_luong * 4:  # giữ hàng chờ ngắn: ít file phải đọc lại khi sập
+                    kp = con.pop()
+                    try:
+                        dang[ex.submit(ham, kp[1])] = kp
+                    except BrokenProcessPool:
+                        con.append(kp); hong = True
+                _dung()
+                for f in wait(dang, timeout=0.5, return_when=FIRST_COMPLETED)[0]:
+                    kp = dang.pop(f)
+                    try:
+                        ghi(kp, f.result())
+                    except BrokenProcessPool:
+                        nghi.append(kp); hong = True
+        finally:
+            ex.shutdown(wait=True, cancel_futures=True)
+    for kp in nghi:  # lượt có tiến trình sập: đọc lại riêng từng file để tìm đúng file gây sập
+        _dung()
+        with ProcessPoolExecutor(1) as ex:
+            try:
+                v = ex.submit(ham, kp[1]).result()
+            except BrokenProcessPool:
+                cache.loi(kp[0], kp[1], "file làm sập tiến trình đọc PDF (file hỏng?)"); xong += 1
+                continue
+        ghi(kp, v)
+    cache.db.commit()
+    return tong
+
+
+def _trich_thu(path):
+    """Chỉ dùng trong _test: file tên 'sap' làm tiến trình con chết đột ngột như PDF hỏng làm sập thư viện."""
+    if "sap" in os.path.basename(path):
+        os._exit(3)
+    return trich(path)
 
 
 def _dong_file(cac_file):
@@ -1311,6 +1378,20 @@ def gui(so_tab=2):
             log(f"CHÚ Ý: lần chạy trước tool tắt đột ngột khi đang đọc file này (file hỏng?) - lần này bỏ qua, "
                 f"coi là không đọc được: {x}")
             flog.write(f"File làm tool tắt, đã đánh dấu bỏ qua: {x}\n")
+
+        def doc_song_song(paths, nhan):
+            """Đọc trước song song các file PDF/DOCX chưa có trong cache; các bước sau lấy từ cache."""
+            n0, t0 = len(cache.vua_loi), time.time()
+            try:
+                n = doc_truoc(cache, paths, progress=lambda x, t: bao(f"{nhan} - đọc song song {SO_LUONG} tiến trình", x, t))
+            except DaDung:
+                return  # DUNG vẫn bật: bước sau dừng ngay, ghi kết quả phần đã làm
+            if n:
+                log(f"  Đọc song song {n} file PDF/DOCX ({SO_LUONG} tiến trình): {_gio(time.time() - t0)}")
+            for x in cache.vua_loi[n0:]:
+                log(f"CHÚ Ý: file làm sập tiến trình đọc PDF (file hỏng?) - bỏ qua, coi là không đọc được: {x}")
+                flog.write(f"File làm sập tiến trình đọc, đã đánh dấu bỏ qua: {x}\n")
+
         try:
             if nhan_lech:
                 lech = [r for r in kq if str(r["tinh_trang"]).startswith("LỆCH NĂM")]
@@ -1320,6 +1401,7 @@ def gui(so_tab=2):
                 so = [{p for _, p in _dong_file(r["cac_file"]) if p.lower().endswith((".pdf", ".doc", ".docx"))} for r in lech]
                 da, tong, t0 = set(), len(set().union(*so)), time.time()
                 log(f"LỆCH NĂM: {len(lech)} dòng, {tong} file Word/PDF cần mở (file đã có trong cache không phải đọc lại)")
+                doc_song_song(set().union(*so), nhan_lech)
                 bao(nhan_lech, 0, tong)
                 for i, (r, n) in enumerate(zip(lech, so), 1):
                     if DUNG.is_set():
@@ -1334,14 +1416,15 @@ def gui(so_tab=2):
                 da_khop = {os.path.dirname(x) for r in kq if r["tinh_trang"] == "KHỚP" for x in (r["file_word"], r["file_pdf"]) if x}
                 ds = [f for f in files if os.path.dirname(f["path"]) not in da_khop]
                 n_doc = sum(f["dinh_dang"] in DOC_DUOC for f in ds)
-                uoc = n_doc * GIAY_MOI_FILE
+                uoc = n_doc * GIAY_MOI_FILE / SO_LUONG
                 log(f"KHÔNG TÌM THẤY: {len(ktt)} dòng, quét lời nói đầu {n_doc} file PDF/DOCX, ước tính lần đầu ~{_gio(uoc)} "
-                    "(file đã có trong cache nhanh hơn nhiều)")
+                    f"với {SO_LUONG} tiến trình (file đã có trong cache nhanh hơn nhiều; ổ chậm thì lâu hơn)")
                 if uoc > 1800 and not hoi(
                         f"Quét lời nói đầu {n_doc} file PDF/DOCX ước tính mất khoảng {_gio(uoc)} (ổ cục bộ; ổ mạng có thể lâu hơn).\n\n"
                         "Có thể bấm ■ Dừng bất cứ lúc nào: phần đã đọc được lưu cache, chạy lại sẽ làm tiếp.\n\nVẫn chạy?"):
                     log("  Bỏ qua bước quét lời nói đầu.")
                 else:
+                    doc_song_song([f["path"] for f in ds if f["dinh_dang"] in DOC_DUOC], nhan_ktt)
                     t0 = time.time()
                     bao(nhan_ktt, 0, len(ds))
                     def prog(i):
@@ -1559,7 +1642,6 @@ def _test():
     assert ten_file_moi("Tên sách", "1/2021", "PL", "TB") == "ten_sach_0121_R_PL_T01"
     assert ten_file_moi("Tên sách", None, "Đ", None) == "ten_sach_R_D_M00"
     # mã BBT quy định (BBT_distinct.xlsx cột F): theo đúng giá trị cột J, ô trống = '(trống)', chưa điền thì giữ BBT bỏ dấu
-    import openpyxl
     wbm = openpyxl.Workbook(); wsm = wbm.active
     for r in (["STT", "BBT", "Mã", "Số", "Năm", "Mã quy định"], [1, "Đảng", "DANG", 1, "", "Đ"], [2, "(trống)", "XX", 1, "", "kxd"],
               [3, "PL", "PL", 1, "", None], [4, "Vụ KH", "VUKH", 1, "", "vụ-kh 2"], [5, 0, "0", 1, "", 0], [6, "KT", "KT", 1, "", 5]):
@@ -1950,6 +2032,13 @@ def _test():
     png = os.path.join(tb, "bia.png"); open(png, "wb").write(b"png moi")
     khp = ke_hoach_luu([dict(rb, dich="", cac_file=rb["cac_file"] + f"\n2023-01-01 00:00:00  {png}")], dich)
     assert next(d for _, s, d in khp if s == png).endswith("sach_co_bia_0523_B_PL_T01_2.png")  # không ghi đè file khác
+    # đọc song song: tiến trình con sập chỉ bỏ qua đúng file gây sập, các file khác vẫn đọc được; chạy lại lấy từ cache
+    ss = [lam_pdf(f"ss{i}.pdf", 3) for i in range(6)] + [lam_pdf("sap.pdf", 3)]
+    cs = Cache(os.path.join(tmp, "ss.sqlite"))
+    assert doc_truoc(cs, ss + [anh, ss[0]], 2, ham=_trich_thu) == 7 and cs.vua_loi == [ss[-1]]
+    assert all(cs.get(_khoa_cache(p))["trang"] == 3 for p in ss[:-1]) and cs.get(_khoa_cache(ss[-1]), 1) is None
+    assert cs.db.execute("select count(*) from file_loi").fetchone()[0] == 1 and doc_truoc(cs, ss, 2) == 0
+    cs.dong()
     # lỗi một file không làm dừng cả lượt
     hong = dict(kq2[0], file_word=os.path.join(tmp, "khong_co.docx"), ten_moi="sach_loi", dich="", ghi_chu="")
     goi = []
@@ -1966,4 +2055,6 @@ def _test():
 
 
 if __name__ == "__main__":
-    _test() if "--test" in sys.argv else gui(4 if "--4tab" in sys.argv else 2)
+    import multiprocessing; multiprocessing.freeze_support()  # exe: tiến trình con đọc PDF song song
+    import sxb_tool  # chạy qua module sxb_tool (không phải __main__): tiến trình con của exe mới gọi được trich()
+    sxb_tool._test() if "--test" in sys.argv else sxb_tool.gui(4 if "--4tab" in sys.argv else 2)
