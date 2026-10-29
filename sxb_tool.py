@@ -735,6 +735,8 @@ def _doc_word(path):
     with open(duong_dan_dai(path), "rb") as f:
         if f.read(8) != b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":  # không phải file Word 97-2003 thật
             return None
+    if os.name != "nt":
+        return _doc_linux(path)
     if not _word_app():
         return None
     mo, tam = os.path.abspath(path), None
@@ -771,6 +773,21 @@ def _doc_word(path):
                 os.remove(tam)
             except OSError:
                 pass
+
+
+def _doc_linux(path):
+    """.doc trên Linux (không có Word): antiword, không có thì catdoc (sudo apt install antiword catdoc).
+    -> (KY_DAU ký tự đầu, KY_CUOI ký tự cuối); None nếu máy không có hai lệnh này hoặc đọc lỗi/quá giờ."""
+    for lenh in (["antiword", "-m", "UTF-8.txt", "-w", "0"], ["catdoc", "-d", "utf-8", "-w"]):
+        if shutil.which(lenh[0]):
+            try:
+                r = subprocess.run(lenh + [path], capture_output=True, timeout=WORD_HET_GIO)
+            except subprocess.TimeoutExpired:
+                return None
+            t = r.stdout.decode("utf-8", "replace")
+            if r.returncode == 0 and t.strip():
+                return t[:KY_DAU], t[-KY_CUOI:]
+    return None
 
 
 def _docx_text(path):
@@ -829,7 +846,15 @@ def trich(path, so_trang=8):
 
 
 def _pid_song(pid):
-    """Tiến trình pid còn chạy không (Windows)."""
+    """Tiến trình pid còn chạy không."""
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            pass
+        return True
     import ctypes
     k = ctypes.windll.kernel32
     h = k.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
@@ -942,6 +967,8 @@ def doc_truoc(cache, paths, so_luong=SO_LUONG, progress=None, ham=trich):
     progress(xong, tong). Bấm Dừng: DaDung, phần đã đọc giữ trong cache. -> số file đã đọc."""
     from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
     from concurrent.futures.process import BrokenProcessPool
+    import multiprocessing
+    mp = multiprocessing.get_context("spawn")  # Linux mặc định fork: fork từ tiến trình đang có luồng giao diện dễ treo
     viec = {}
     for p in paths:
         k = p.lower().endswith((".pdf", ".docx")) and _khoa_cache(p)
@@ -959,7 +986,7 @@ def doc_truoc(cache, paths, so_luong=SO_LUONG, progress=None, ham=trich):
 
     # ponytail: không có thời hạn cho từng file - một PDF làm thư viện treo hẳn (hiếm) sẽ giữ một tiến trình tới khi bấm Dừng
     while con:
-        ex, dang, hong = ProcessPoolExecutor(so_luong), {}, False
+        ex, dang, hong = ProcessPoolExecutor(so_luong, mp_context=mp), {}, False
         try:
             while dang or (con and not hong):
                 while con and not hong and len(dang) < so_luong * 4:  # giữ hàng chờ ngắn: ít file phải đọc lại khi sập
@@ -979,7 +1006,7 @@ def doc_truoc(cache, paths, so_luong=SO_LUONG, progress=None, ham=trich):
             ex.shutdown(wait=True, cancel_futures=True)
     for kp in nghi:  # lượt có tiến trình sập: đọc lại riêng từng file để tìm đúng file gây sập
         _dung()
-        with ProcessPoolExecutor(1) as ex:
+        with ProcessPoolExecutor(1, mp_context=mp) as ex:
             try:
                 v = ex.submit(ham, kp[1]).result()
             except BrokenProcessPool:
@@ -1762,6 +1789,7 @@ def _test():
            tm("CHAY (Tr2, 4)", "pdf", "2021-05-01 00:00:00", r"K\Đèn xanh, đèn đỏ\in\CHAY (Tr2, 4).pdf", r"Đèn xanh, đèn đỏ\in"),
            tm("x", "pdf", "2020-01-01 00:00:00", r"K\Đèn xanh, đèn đỏ (1)\x.pdf", "Đèn xanh, đèn đỏ (1)"),
            tm("doi ngoai", "pdf", "2021-01-01 00:00:00", r"K\Đối ngoại quốc phòng\doi ngoai.pdf", "Đối ngoại quốc phòng")]
+    kho = [dict(k, path=k["path"].replace("\\", os.sep), thu_muc=k["thu_muc"].replace("\\", os.sep)) for k in kho]  # Linux: /
     import io; buf = io.StringIO(); w = csv.DictWriter(buf, kho[0].keys()); w.writeheader(); w.writerows(kho)
     cp = os.path.join(tempfile.mkdtemp(), "k.csv"); open(cp, "w", encoding="utf-8-sig", newline="").write(buf.getvalue())
     files = doc_kho(cp)
@@ -1828,8 +1856,7 @@ def _test():
     assert trich(dx)["nam"] == [2019] and "luat dau tu" in trich(dx)["lnd"] and trich(doc) is None
     assert _docx_text(dx) == "Bia\nLời Nhà xuất bản\nCuốn sách Luật đầu tư được tái bản.\nNội dung\nNộp lưu chiểu tháng 6 năm 2019"
     try:  # .doc thật: tạo bằng Word từ b.docx rồi đọc lại (bỏ qua nếu máy không có Word)
-        import win32com.client
-        w = _word_app()
+        w = os.name == "nt" and _word_app()
         if w:
             doc2 = os.path.join(tmp, "e.doc"); dd = w.Documents.Open(dx); dd.SaveAs2(doc2, FileFormat=0); dd.Close(False)
             t2 = trich(doc2)
