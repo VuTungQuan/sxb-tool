@@ -19,6 +19,15 @@ Bấm đúp `build.bat`: tự tìm Python (biến `PYTHON` nếu đặt, rồi `
 copy đi máy khác chạy được ngay. Lần đầu mở mất vài giây vì exe tự giải nén. Nếu Windows Defender cảnh báo thì chọn
 "Run anyway" (exe PyInstaller chưa ký số). Hai bản dùng chung thư mục `ketqua/` và cache khi để cạnh nhau.
 
+## Chạy trên Ubuntu (Linux)
+Build trên chính máy Ubuntu (PyInstaller không build chéo từ Windows sang Linux):
+```bash
+bash build.sh
+```
+`build.sh` tự cài gói còn thiếu (`python3-tk`, `python3-venv`, `antiword`, `catdoc`, `binutils`, `libpython3-dev` - cần sudo), tạo môi trường `.venv-linux`, cài thư viện, tự kiểm tra rồi tạo `dist-linux/SXBTool` (2 tab) và `dist-linux/SXBTool_4tab` (4 tab). Chạy: `./dist-linux/SXBTool` (cần `chmod +x` nếu chép từ Windows sang). File build trên Ubuntu 22.04 chạy được trên 22.04 và 24.04 (bản Ubuntu cũ hơn thì build lại trên chính máy đó). Không build cũng chạy được: `python3 sxb_tool.py` (hoặc `sxb_tool_4tab.py`).
+
+Khác bản Windows: file `.doc` đọc bằng `antiword` (không có thì `catdoc`) thay cho Microsoft Word. Đường dẫn trong file kết quả là đường dẫn Linux (`/mnt/kho/...`), nên kết quả quét trên Linux dùng tiếp trên Linux.
+
 ## Thư mục kết quả
 Tool tự tạo `ketqua/` cạnh file exe (có thể đổi trong từng tab):
 - `1_quet_kho`: file kho `kho_*.xlsx` và cache kết quả đọc file `cache_noi_dung.sqlite` (dùng chung mọi lần chạy: file đã đọc không đọc lại)
