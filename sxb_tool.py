@@ -1289,6 +1289,8 @@ def gui(so_tab=2):
         """Thanh tiến độ + dòng trạng thái + khung log, từ hàng `dong` trở xuống."""
         pb = ttk.Progressbar(parent, maximum=1000); pb.grid(row=dong, column=0, columnspan=3, sticky="we", pady=(6, 0))
         lb = ttk.Label(parent, text=""); lb.grid(row=dong + 1, column=0, columnspan=3, sticky="w")
+        # dòng dài (phông Ubuntu to hơn, nhiều tiến trình) tự xuống dòng thay vì bị cắt mất phần %, thời gian còn lại
+        parent.bind("<Configure>", lambda e: lb.config(wraplength=e.width - 24), add="+")
         tx = tk.Text(parent, height=10, wrap="word"); tx.grid(row=dong + 2, column=0, columnspan=3, sticky="we", pady=6)
         return pb, lb, tx
 
