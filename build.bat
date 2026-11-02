@@ -28,7 +28,7 @@ if errorlevel 1 (echo [LOI] Python nay khong co pip.& goto loi)
 echo Kiem tra thu vien:
 call :kiem openpyxl openpyxl || goto loi
 REM pymupdf ghim duoi 2.0: ban 2.0 keo theo onnxruntime, numpy... (cai lau, exe nang hon); tool da thu voi 1.26
-call :kiem fitz "pymupdf>=1.24,<2" || goto loi
+call :kiem pymupdf "pymupdf>=1.24.3,<2" || goto loi
 call :kiem docx python-docx || goto loi
 call :kiem win32com.client pywin32 || goto loi
 call :kiem PyInstaller pyinstaller || goto loi

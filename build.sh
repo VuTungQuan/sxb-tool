@@ -26,7 +26,7 @@ PY="${PYTHON:-python3}"
 [ -x .venv-linux/bin/python ] || "$PY" -m venv .venv-linux
 V=.venv-linux/bin/python
 "$V" -m pip install -q --disable-pip-version-check --upgrade pip
-"$V" -m pip install -q --disable-pip-version-check openpyxl "pymupdf>=1.24,<2" python-docx pyinstaller
+"$V" -m pip install -q --disable-pip-version-check openpyxl "pymupdf>=1.24.3,<2" python-docx pyinstaller
 "$V" -c 'import sys, fitz; print("Python", sys.version.split()[0], "- PyMuPDF", fitz.VersionBind)'
 
 # 3. Tự kiểm tra trước khi build

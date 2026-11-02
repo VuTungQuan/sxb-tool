@@ -357,7 +357,7 @@ def la_bia(path, key_sach=""):
 def so_trang_pdf(path):
     """Số trang PDF (None nếu không mở được)."""
     try:
-        import fitz
+        import pymupdf as fitz
         with fitz.open(duong_dan_dai(path)) as d:
             return len(d)
     except Exception:
@@ -371,7 +371,7 @@ def pdf_mong(path):
     if not path.lower().endswith(".pdf"):
         return False
     try:
-        import fitz
+        import pymupdf as fitz
         with fitz.open(duong_dan_dai(path)) as d:
             n, r = len(d), (d[0].rect if len(d) else None)
     except Exception:
@@ -816,7 +816,7 @@ def trich(path, so_trang=8):
     p, them = duong_dan_dai(path), {}
     try:
         if ext == ".pdf":
-            import fitz
+            import pymupdf as fitz
             with fitz.open(p) as d:
                 n = len(d)
                 xem = sorted(set(range(min(so_trang, n))) | set(range(max(0, n - 2), n)))
@@ -1658,7 +1658,8 @@ def gui(so_tab=2):
 
 # ---------- tự kiểm tra ----------
 def _test():
-    import tempfile, fitz, docx, openpyxl
+    import tempfile, docx, openpyxl
+    import pymupdf as fitz
     assert chuan_hoa("Lịch sử Chính phủ Việt Nam- T1") == "lich su chinh phu viet nam t1"
     assert chuan_hoa("Đổi mới  công tác\n") == "doi moi cong tac"
     assert ma_ngay("01-2015") == "0115" and ma_ngay("1/2025") == "0125"
