@@ -376,7 +376,7 @@ def pdf_mong(path):
             n, r = len(d), (d[0].rect if len(d) else None)
     except Exception:
         return False
-    return 0 < n <= 2 or (n <= 8 and r.width > 1.3 * r.height)
+    return 0 < n <= 2 or (2 < n <= 8 and r.width > 1.3 * r.height)  # PDF hỏng 0 trang: r = None
 
 
 def chon_file(ds, key_sach=""):
@@ -2046,6 +2046,11 @@ def _test():
     d = fitz.open(); d.new_page(width=1148, height=567); d.new_page(width=348, height=567); d.new_page(width=348, height=567)
     trai = os.path.join(tb, "trai_sach.pdf"); d.save(trai); d.close()
     assert pdf_mong(trai) and not pdf_mong(ruot)
+    rong = os.path.join(tb, "rong.pdf")  # PDF hỏng 0 trang (PyMuPDF vẫn mở được): không làm sập bước chọn file
+    with open(rong, "wb") as f:
+        f.write(b"%PDF-1.4\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n"
+                b"2 0 obj << /Type /Pages /Kids [] /Count 0 >> endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n")
+    assert not pdf_mong(rong) and chon_file([("2023-01-01 00:00:00", rong), ("2023-01-01 00:00:00", ruot)])[1] == ruot
     assert chon_file([("2023-02-01 00:00:00", trai), ("2023-01-01 00:00:00", ruot)])[1] == ruot
     chi_bia = dict(kq2[0], file_word="", file_pdf="", ten_moi="chi_co_bia_0523_R_PL_T01", dich="",
                    cac_file=f"2023-02-01 00:00:00  {trai}\n2023-01-01 00:00:00  {anh}")
