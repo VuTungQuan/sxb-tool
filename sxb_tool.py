@@ -332,7 +332,8 @@ def doc_kho(path):
                     rows.append(_dong_kho(r["Tên file"], r["Định dạng"], d.strftime("%Y-%m-%d %H:%M:%S"), r["Đường dẫn"]))
                 else:
                     rows.append(_dong_kho(r["ten_file"], r["dinh_dang"], r["date_modified"], r["path"]))
-    return rows
+    # file rác không phải sách: '~$x.doc' (file tạm Word đang mở), '._x.pdf' (file phụ của macOS)
+    return [r for r in rows if not os.path.basename(r["path"]).startswith(("~$", "._"))]
 
 
 def _dong_kho(ten_file, dinh_dang, date_modified, path):
@@ -417,6 +418,13 @@ def ten_bia(ten_moi):
     return re.sub(r"_R_(?=[A-Z0-9]+_[MT]\d\d$)", "_B_", ten_moi, count=1)
 
 
+# Tình trạng dòng LỆCH NĂM sau khi đọc nội dung mà không thấy đúng năm (phan_loai_lech); xếp theo thứ tự cần xem ở sheet CAN_XU_LY
+TT_THU_MUC, TT_LECH_1, TT_LECH_GON, TT_LECH = ("KHỚP THEO THƯ MỤC NĂM - nên xem", "LỆCH NĂM - lệch 1 năm, xem trước",
+                                               "LỆCH NĂM - thư mục rút gọn, cần xem", "LỆCH NĂM - cần mở file kiểm tra")
+TT_KHONG_BAN, TT_KHONG_RUOT = "KHÔNG CÓ BẢN ĐÚNG NĂM", "KHÔNG CÓ FILE RUỘT"
+THU_TU_XEM = {t: i for i, t in enumerate((TT_THU_MUC, TT_LECH_1, TT_LECH_GON, TT_LECH))}
+
+
 def doi_chieu(sach, files):
     """Khớp tên sách với tên file HOẶC tên thư mục chứa file (kho xếp mỗi sách một thư mục)."""
     theo_key, ten_sach = set(), {loi_ten(s["ten"]) for s in sach}
@@ -451,7 +459,7 @@ def doi_chieu(sach, files):
         if not tim:
             r["tinh_trang"] = "KHÔNG TÌM THẤY FILE"
         elif not khop_nam:
-            r["tinh_trang"] = "LỆCH NĂM - cần mở file kiểm tra"
+            r["tinh_trang"] = TT_LECH
         else:
             r["tinh_trang"] = "KHỚP"
             r["file_word"], r["file_pdf"], bia = chon_file([(f["date_modified"], f["path"]) for f in khop_nam], key)
@@ -486,7 +494,8 @@ def doi_chieu_thu_muc(kq, files, cache=None):
         theo_tm[os.path.dirname(f["path"])].append(f)
     for r in kq:
         nhan = f"{r['nam']} - dòng {r['dong']} - {r['ten']}"
-        chon = {os.path.dirname(x) for x in (r["file_word"], r["file_pdf"]) if x}
+        # chỉ dòng KHỚP: file gợi ý của dòng 'theo thư mục năm' chưa được xác nhận
+        chon = {os.path.dirname(x) for x in (r["file_word"], r["file_pdf"]) if x and r["tinh_trang"] == "KHỚP"}
         for tm in chon:
             khop[tm].append(nhan)
         for tm in {os.path.dirname(x) for _, x in _dong_file(r["cac_file"])} - chon:
@@ -576,9 +585,11 @@ def ghi_ket_qua(kq, xlsx_goc, thu_muc_ra, thu_muc=(), can_ocr=()):
                      ("CAN_XU_LY", lambda r: r["tinh_trang"] != "KHỚP")):
         ws = wb.create_sheet(ten)
         ws.append([h for _, h in COT_KQ])
-        for r in kq:
+        for r in sorted(kq, key=lambda r: THU_TU_XEM.get(r["tinh_trang"], len(THU_TU_XEM))):  # dòng cần người xem lên đầu
             if loc(r):
                 ws.append([_cell(r.get(k, "")) for k, _ in COT_KQ])
+        ws.auto_filter.ref = ws.dimensions
+        ws.freeze_panes = "A2"
     for ten, rows, cot in (("THU_MUC_KHO", thu_muc, COT_TM), ("CAN_OCR", can_ocr, COT_OCR)):
         if rows:
             ws = wb.create_sheet(ten)
@@ -1060,9 +1071,45 @@ def file_theo_dm(kq):
             for d, p in _dong_file(r["cac_file"]) if d[:4] == str(r["nam"])}
 
 
+def nam_thu_muc(path):
+    """Năm của thư mục năm gần file nhất: 'SACH NAM 2012', 'NAM 2012', 'Sach 2014', 'SACH LUAT 2024'...; không có -> None.
+    Không tính 'bia 2019' (năm làm bìa) và dải '2007-2011'."""
+    for x in reversed(re.split(r"[\\/]", path)[:-1]):
+        m = re.fullmatch(r"(?:luu )?(?:sach|nam)(?: [a-z]+){0,2} (20\d\d)", chuan_hoa(x))
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def phan_loai_lech(r, con_lai, thay):
+    """Dòng đã đọc nội dung mà không thấy đúng năm: tự kết luận được thì đổi tình trạng để khỏi phải mở file.
+    con_lai: file chưa thuộc sách năm khác; thay: các năm đọc được. -> lý do (ghi đầu Ghi chú), '' nếu chưa kết luận được."""
+    nam, key = r["nam"], chuan_hoa(r["ten"])
+    tat = [x for x in _dong_file(r["cac_file"]) if x[1].lower().endswith((".pdf", ".doc", ".docx"))]
+    # ponytail: thư mục năm đúng ~87% (kiểm trên file đã KHỚP, sai chủ yếu lệch 1 năm) nên chỉ gợi ý, không coi là KHỚP
+    w, p = chon_file([x for x in tat if nam_thu_muc(x[1]) == nam], key)[:2]
+    if not tat:
+        r["tinh_trang"] = TT_KHONG_RUOT
+        return "chỉ có ảnh/file thiết kế, không có file Word/PDF"
+    if w or p:
+        r.update(tinh_trang=TT_THU_MUC, file_word=w, file_pdf=p)
+        return f"gợi ý file trong thư mục năm {nam}: nếu đúng, sửa ô Tình trạng thành KHỚP rồi chạy Đổi tên & lưu"
+    if not any(x[1].lower().endswith((".pdf", ".doc", ".docx")) for x in con_lai):
+        r["tinh_trang"] = TT_KHONG_BAN
+        return "mọi file Word/PDF đều thuộc sách năm khác theo Date Modified"
+    if nam - 1 in {int(d[:4]) for d, _ in tat} or {nam - 1, nam + 1} & thay:  # bản thảo sửa năm trước, lưu chiểu năm sau
+        r["tinh_trang"] = TT_LECH_1
+    elif r.get("kieu_khop") == "thư mục rút gọn":  # tên thư mục ngắn (vd 'HỒ CHÍ MINH'): dễ khớp nhầm
+        r["tinh_trang"] = TT_LECH_GON
+    elif thay:
+        r["tinh_trang"] = TT_KHONG_BAN
+        return "file trong kho ghi năm khác"
+    return ""
+
+
 def xu_ly_lech_nam(r, cache, theo_dm=None):
     """Dòng LỆCH NĂM: mở từng file trong 'Tất cả file tìm được', nhận file có năm cột Năm ở trang cuối,
-    không có thì ở 8 trang đầu (cùng các file khác trong thư mục đó).
+    không có thì ở 8 trang đầu (cùng các file khác trong thư mục đó). Không có file nào đúng năm thì phan_loai_lech.
     theo_dm (file_theo_dm): file đã thuộc sách năm khác theo Date Modified thì không xét lại bằng nội dung."""
     theo_dm = theo_dm or {}
     ds = [x for x in _dong_file(r["cac_file"]) if theo_dm.get(x[1], r["nam"]) == r["nam"]]
@@ -1087,7 +1134,8 @@ def xu_ly_lech_nam(r, cache, theo_dm=None):
         ghi.insert(0, f"không thấy năm {r['nam']} ở trang cuối/8 trang đầu (thấy: {', '.join(map(str, sorted(thay))) or '-'})")
         if ocr:
             ghi.append("cần OCR (PDF không có lớp chữ): " + ", ".join(ocr))
-        r["ghi_chu"] = "; ".join(ghi)
+        ly_do = phan_loai_lech(r, ds, thay)
+        r["ghi_chu"] = "; ".join(([ly_do] if ly_do else []) + ghi)
 
 
 def loc_files(files, thu_muc="", nam=""):
@@ -1796,6 +1844,11 @@ def _test():
     import io; buf = io.StringIO(); w = csv.DictWriter(buf, kho[0].keys()); w.writeheader(); w.writerows(kho)
     cp = os.path.join(tempfile.mkdtemp(), "k.csv"); open(cp, "w", encoding="utf-8-sig", newline="").write(buf.getvalue())
     files = doc_kho(cp)
+    assert len(files) == len(kho)  # kho mẫu không có file rác
+    cr = os.path.join(os.path.dirname(cp), "r.csv")
+    with open(cr, "w", encoding="utf-8-sig", newline="") as fr:
+        wr = csv.DictWriter(fr, kho[0].keys()); wr.writeheader(); wr.writerows(kho[:1] + [dict(kho[0], path=os.path.join("K", x)) for x in ("~$a.doc", "._a.pdf")])
+    assert len(doc_kho(cr)) == 1  # '~$a.doc', '._a.pdf' không phải sách
     assert key_thu_muc(os.path.dirname(files[3]["path"])) == ["k", "den xanh den do", "in"]
     assert key_thu_muc(os.path.dirname(files[4]["path"])) == ["k", "den xanh den do"] and "ten_file" not in files[0]
     kq = doi_chieu([dict(nam=2021, dong=2, tt=1, ten="Đèn xanh, đèn đỏ", lan="TB", bbt="QT", qdxb="03/2021"),
@@ -1915,14 +1968,33 @@ def _test():
         rh = dict(r, nam=nam, tinh_trang="LỆCH NĂM", cac_file="2021-01-01 00:00:00  " + hai); xu_ly_lech_nam(rh, cache)
         assert rh["tinh_trang"] == "KHỚP" and rh["ghi_chu"] == f"khớp theo nội dung ({nguon})"
     rh = dict(r, nam=2015, tinh_trang="LỆCH NĂM", cac_file="2021-01-01 00:00:00  " + hai); xu_ly_lech_nam(rh, cache)
-    assert rh["tinh_trang"] == "LỆCH NĂM" and "thấy: 2020, 2021" in rh["ghi_chu"]  # năm trong nội dung không tính
+    assert rh["tinh_trang"] == TT_KHONG_BAN and "thấy: 2020, 2021" in rh["ghi_chu"]  # năm trong nội dung không tính
     # file đã thuộc sách năm 2020 theo Date Modified -> dòng 2021 không đọc lại nội dung file đó
     rh = dict(r, nam=2021, tinh_trang="LỆCH NĂM", cac_file="2020-06-01 00:00:00  " + hai); xu_ly_lech_nam(rh, cache, {hai: 2020})
-    assert rh["tinh_trang"] == "LỆCH NĂM" and "h.pdf đã thuộc sách năm 2020 theo Date Modified" in rh["ghi_chu"]
+    assert rh["tinh_trang"] == TT_KHONG_BAN and "h.pdf đã thuộc sách năm 2020 theo Date Modified" in rh["ghi_chu"]
+    assert rh["ghi_chu"].startswith("mọi file Word/PDF đều thuộc sách năm khác")
     rh = dict(r, nam=2015, tinh_trang="LỆCH NĂM", cac_file="2021-01-01 00:00:00  " + hai); xu_ly_lech_nam(rh, cache)
-    assert rh["tinh_trang"] == "LỆCH NĂM" and "thấy: 2020, 2021" in rh["ghi_chu"]  # năm trong nội dung không tính
+    assert rh["tinh_trang"] == TT_KHONG_BAN and "thấy: 2020, 2021" in rh["ghi_chu"]  # năm trong nội dung không tính
     r2 = dict(r, nam=2020, tinh_trang="LỆCH NĂM - cần mở file kiểm tra"); xu_ly_lech_nam(r2, cache)
-    assert r2["tinh_trang"].startswith("LỆCH NĂM") and "thấy: 2019, 2023" in r2["ghi_chu"] and "bia.jpg" not in r2["ghi_chu"]
+    assert r2["tinh_trang"] == TT_LECH_1 and "thấy: 2019, 2023" in r2["ghi_chu"] and "bia.jpg" not in r2["ghi_chu"]
+    # phân loại dòng không thấy đúng năm (ghi chú 'thấy:' do xu_ly_lech_nam ghi)
+    assert [nam_thu_muc(x) for x in ("K/SACH NAM 2012/LUAT/a.doc", r"K\Sach 2014\Ban.doc", "K/NĂM 2021/a.doc", "K/SACH LUAT 2024/a.doc",
+                                     "K/LUU SACH NAM 2005/T5/a.doc", "K/NAM 2012/SACH 2013/a.doc", "K/bia 2019/a.doc",
+                                     "K/HANG MI SACH 2007-2011/a.doc", "K/Sach Luat/a.doc")] == [2012, 2014, 2021, 2024, 2005, 2013, None, None, None]
+    def pl(nam, kieu="chính xác", thay=(), con=True, *ds):
+        rp = dict(r, nam=nam, tinh_trang=TT_LECH, kieu_khop=kieu, file_word="", file_pdf="", cac_file=chr(10).join(f"{d} 00:00:00  {x}" for d, x in ds))
+        return rp, phan_loai_lech(rp, _dong_file(rp["cac_file"]) if con else [], set(thay))
+    assert pl(2020, "chính xác", (), True, ("2020-01-01", "K/bia.jpg"))[0]["tinh_trang"] == TT_KHONG_RUOT
+    rp, ld = pl(2012, "chính xác", (), True, ("2015-01-01", "K/SACH NAM 2012/a.doc"), ("2015-01-01", "K/SACH NAM 2015/a.doc"))
+    assert rp["tinh_trang"] == TT_THU_MUC and rp["file_word"] == "K/SACH NAM 2012/a.doc" and "sửa ô Tình trạng thành KHỚP" in ld
+    assert pl(2012, "chính xác", (), False, ("2015-01-01", "K/a.doc"))[0]["tinh_trang"] == TT_KHONG_BAN  # mọi file thuộc năm khác
+    assert pl(2012, "chính xác", (), True, ("2011-12-20", "K/a.doc"))[0]["tinh_trang"] == TT_LECH_1  # bản thảo sửa cuối năm trước
+    assert pl(2012, "chính xác", (2013,), True, ("2018-01-01", "K/a.doc"))[0]["tinh_trang"] == TT_LECH_1  # lưu chiểu năm sau
+    assert pl(2012, "chính xác", (2013,), True, ("2013-01-01", "K/a.doc"))[0]["tinh_trang"] == TT_LECH_1
+    assert pl(2012, "thư mục rút gọn", (2020,), True, ("2018-01-01", "K/a.doc"))[0]["tinh_trang"] == TT_LECH_GON
+    assert pl(2012, "chính xác", (2020,), True, ("2018-01-01", "K/a.doc"))[0]["tinh_trang"] == TT_KHONG_BAN  # file ghi năm khác xa
+    rp, ld = pl(2012, "chính xác", (), True, ("2018-01-01", "K/a.doc"))
+    assert rp["tinh_trang"] == TT_LECH and ld == ""  # không đọc ra năm: vẫn cần người xem
 
     kho = [dict(ten_file="a", dinh_dang="pdf", date_modified="2021-01-01 00:00:00", path=pdf, nam=2021),
            dict(ten_file="b", dinh_dang="docx", date_modified="2021-06-01 00:00:00", path=dx, nam=2021),

@@ -46,6 +46,20 @@ Nút **■ Dừng** (cuối cửa sổ) dừng bước đang chạy sau file hi�
    - Xuất `doi_chieu_*.xlsx`: sheet `KHOP`, `CAN_XU_LY`, `THU_MUC_KHO` (từng thư mục kho khớp sách nào / chỉ trùng tên / không khớp sách nào) và `CAN_OCR` (PDF không có lớp chữ - ảnh scan, chữ dạng hình vẽ - cần OCR mới đọc được; có cột ưu tiên). Bản sao Excel tổng hợp thêm 4 cột tình trạng, dòng KHỚP tô vàng.
 2. **Đổi tên & lưu**: copy/move file Word, PDF sang `Năm/thang MM/<tên mới>/`, mỗi sách một thư mục, theo tên mới `ten_sach_mmyy_R_BBT_T01` (phần tên sách tối đa 90 ký tự, hằng `DAI_TEN`). Phần `BBT` lấy theo cột "Mã quy định" (cột F) của `BBT_distinct.xlsx` (đặt cạnh Excel tổng hợp hoặc cạnh exe), khớp đúng giá trị cột J; dòng chưa điền mã thì dùng BBT bỏ dấu. File này được đọc lại mỗi lần đối chiếu, sửa mã xong chạy lại đối chiếu là có tên mới. File bìa cùng thư mục với file ruột - ảnh (.jpg, .png, .tif), file thiết kế (.ai, .psd, .eps), PDF 1-2 trang, PDF ≤ 8 trang có trang đầu nằm ngang (trải bìa + tai gập) hoặc PDF tên 'Bìa / Tờ che / Tr 2-4' - được chép vào `<tên mới>/Bia/`, tên đổi `_R_` (Ruột) thành `_B_` (Bìa), nhiều bìa cùng đuôi thì thêm `_2`, `_3`. PDF 1-2 trang không bao giờ được chọn làm ruột. Chạy lại được: file đã có thì bỏ qua; file lỗi ghi vào Ghi chú rồi làm tiếp; kiểm tra ổ đích đủ chỗ trước khi chép.
 
+## Dòng LỆCH NĂM sau khi đọc nội dung
+Dòng không thấy file đúng năm được tự phân loại (sheet `CAN_XU_LY`, dòng cần xem xếp lên đầu, có bộ lọc):
+
+| Tình trạng | Ý nghĩa | Cần làm |
+|---|---|---|
+| `KHỚP THEO THƯ MỤC NĂM - nên xem` | Có file trong thư mục năm đúng (`SACH NAM 2012`, `Sach 2014`), đã điền sẵn file gợi ý | Xem nhanh; đúng thì sửa ô Tình trạng thành `KHỚP` rồi chạy Đổi tên & lưu |
+| `LỆCH NĂM - lệch 1 năm, xem trước` | Bản thảo sửa năm trước hoặc lưu chiểu năm sau | Mở file kiểm tra |
+| `LỆCH NĂM - thư mục rút gọn, cần xem` | Chỉ khớp theo tên thư mục ngắn, dễ nhầm | Mở file kiểm tra |
+| `LỆCH NĂM - cần mở file kiểm tra` | Không đọc ra năm (thường là bản thảo Word không có trang lưu chiểu) | Mở file kiểm tra |
+| `KHÔNG CÓ BẢN ĐÚNG NĂM` | Mọi file thuộc sách năm khác theo Date Modified, hoặc file ghi năm khác xa | Không cần mở; lý do ở cột Ghi chú |
+| `KHÔNG CÓ FILE RUỘT` | Chỉ có ảnh / file thiết kế | Không cần mở |
+
+File `~$...` (file tạm của Word) và `._...` (file phụ của macOS) không được tính là sách. Khi chép kho sang ổ khác phải giữ Date Modified (`cp -a` hoặc `rsync -a`), mất ngày gốc thì số KHỚP giảm rõ rệt.
+
 ## Chạy đa nhân
 Bước kiểm tra nội dung đọc trước các file PDF/DOCX song song bằng nhiều tiến trình (mặc định = một nửa số luồng CPU, ~ số nhân thật: Xeon 16 nhân/32 luồng dùng 16 tiến trình; hằng `SO_LUONG`). Đo trên ~400 file: 26 giây đọc lần lượt còn 3,5 giây với 8 tiến trình; ổ HDD/ổ mạng chậm thì tăng ít hơn. File .doc (đọc qua Word) vẫn đọc lần lượt. Quét kho và chép file phụ thuộc tốc độ ổ đĩa nên không chạy song song. Một file PDF hỏng làm sập tiến trình đọc chỉ làm chết tiến trình con, tool tự tìm đúng file đó, ghi vào nhat_ky_loi.txt và đọc tiếp.
 
