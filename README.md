@@ -1,8 +1,8 @@
 # Tool SXB – đối chiếu kho file với Excel tổng hợp sách xuất bản
 
 Giao diện tkinter, toàn bộ xử lý trong `sxb_tool.py`. Có 2 bản giao diện dùng chung xử lý:
-- **2 tab** (`sxb_tool.py`, `SXBTool.exe`): 1. Đối chiếu (quét kho → khớp tên → kiểm tra nội dung, một nút) | 2. Đổi tên & lưu
-- **4 tab** (`sxb_tool_4tab.py`, `SXBTool_4tab.exe`): 1. Quét kho | 2. Đối chiếu Excel | 3. Kiểm tra nội dung | 4. Đổi tên & lưu
+- **2 tab** (`sxb_tool.py`, `SXBTool.exe`): 1. Đối chiếu (quét kho → khớp tên → kiểm tra nội dung, một nút) | 2. Đổi tên & lưu | 3. Kiểm tra QĐXB
+- **4 tab** (`sxb_tool_4tab.py`, `SXBTool_4tab.exe`): 1. Quét kho | 2. Đối chiếu Excel | 3. Kiểm tra nội dung | 4. Đổi tên & lưu | 5. Kiểm tra QĐXB
 
 Yêu cầu Python 3.9+ (đã thử 3.11) + `openpyxl`, `pymupdf`, `python-docx`, `pywin32` (đọc .doc qua Microsoft Word).
 
@@ -33,6 +33,7 @@ Tool tự tạo `ketqua/` cạnh file exe (có thể đổi trong từng tab):
 - `1_quet_kho`: file kho `kho_*.xlsx` và cache kết quả đọc file `cache_noi_dung.sqlite` (dùng chung mọi lần chạy: file đã đọc không đọc lại)
 - `2_doi_chieu`: file kết quả `doi_chieu_*.xlsx` và bản Excel tổng hợp đánh dấu (dòng KHỚP tô vàng)
 - `3_doi_ten`: file kết quả sau khi đổi tên & lưu
+- `4_kiem_tra_qdxb`: báo cáo `kiem_tra_qdxb_*.xlsx` và Excel đánh dấu thêm cột Kiểm tra QĐXB (cache đọc ở `1_quet_kho/cache_qdxb.sqlite`)
 - `sach_da_luu`: thư mục đích mặc định khi đổi tên & lưu: mỗi sách một thư mục `Năm/thang MM/<tên mới>/<tên mới>.pdf|.docx`
 
 ## Quy trình
@@ -45,6 +46,8 @@ Nút **■ Dừng** (cuối cửa sổ) dừng bước đang chạy sau file hi�
    - *Lời nói đầu (KHÔNG TÌM THẤY)*: tìm câu "cuốn sách <tên sách>" trong lời nói đầu của các file còn lại trong kho.
    - Xuất `doi_chieu_*.xlsx`: sheet `KHOP`, `CAN_XU_LY`, `THU_MUC_KHO` (từng thư mục kho khớp sách nào / chỉ trùng tên / không khớp sách nào) và `CAN_OCR` (PDF không có lớp chữ - ảnh scan, chữ dạng hình vẽ - cần OCR mới đọc được; có cột ưu tiên). Bản sao Excel tổng hợp thêm 4 cột tình trạng, dòng KHỚP tô vàng.
 2. **Đổi tên & lưu**: copy/move file Word, PDF sang `Năm/thang MM/<tên mới>/`, mỗi sách một thư mục, theo tên mới `ten_sach_mmyy_R_BBT_T01` (phần tên sách tối đa 90 ký tự, hằng `DAI_TEN`). Phần `BBT` lấy theo cột "Mã quy định" (cột F) của `BBT_distinct.xlsx` (đặt cạnh Excel tổng hợp hoặc cạnh exe), khớp đúng giá trị cột J; dòng chưa điền mã thì dùng BBT bỏ dấu. File này được đọc lại mỗi lần đối chiếu, sửa mã xong chạy lại đối chiếu là có tên mới. File bìa cùng thư mục với file ruột - ảnh (.jpg, .png, .tif), file thiết kế (.ai, .psd, .eps), PDF 1-2 trang, PDF ≤ 8 trang có trang đầu nằm ngang (trải bìa + tai gập) hoặc PDF tên 'Bìa / Tờ che / Tr 2-4' - được chép vào `<tên mới>/Bia/`, tên đổi `_R_` (Ruột) thành `_B_` (Bìa), nhiều bìa cùng đuôi thì thêm `_2`, `_3`. PDF 1-2 trang không bao giờ được chọn làm ruột. Chạy lại được: file đã có thì bỏ qua; file lỗi ghi vào Ghi chú rồi làm tiếp; kiểm tra ổ đích đủ chỗ trước khi chép.
+3. **Kiểm tra QĐXB**: duyệt thư mục đích đã chép ở bước 2 (bỏ thư mục `Bia`), đọc "Quyết định xuất bản số ..., ngày 04-9-2013" và "nộp lưu chiểu tháng 9-2013" ở 3 trang cuối từng sách (không có thì ở 8 trang đầu), so với cột QĐXB của Excel: tháng + năm nếu Excel ghi `mm/yyyy`, cả ngày nếu `dd/mm/yyyy`. Mỗi thư mục gắn với dòng Excel theo cột "Đường dẫn đích", không có thì theo năm + tên thư mục. Kết quả `ĐÚNG` / `SAI - Excel 01/2013, file 04/09/2013` (tô cam) / `KHÔNG ĐỌC ĐƯỢC QĐXB` (tô xám) / `KHÔNG THẤY Ở THƯ MỤC ĐÍCH`, kèm số QĐXB, tháng lưu chiểu, **tên mới theo ngày QĐXB trên file** và ghi chú khi hai dòng Excel ra cùng một QĐXB (thường do chép trùng một file). Chỉ đọc, không đổi tên hay di chuyển file. Chạy lại trên bản Excel đã đánh dấu thì ghi đè đúng các cột cũ.
+   - Lưu ý năm 2013: Excel gốc không có cột QĐXB, cột ở vị trí đó là "Thời gian có sách" (bản chuẩn hoá gộp vào cột QĐXB), nên năm 2013 sẽ có nhiều dòng SAI dù sách đúng.
 
 ## Dòng LỆCH NĂM sau khi đọc nội dung
 Dòng không thấy file đúng năm được tự phân loại (sheet `CAN_XU_LY`, dòng cần xem xếp lên đầu, có bộ lọc):
