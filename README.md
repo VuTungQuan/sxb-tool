@@ -2,7 +2,7 @@
 
 Giao diện tkinter, toàn bộ xử lý trong `sxb_tool.py`. Có 2 bản giao diện dùng chung xử lý:
 - **2 tab** (`sxb_tool.py`, `SXBTool.exe`): 1. Đối chiếu (quét kho → khớp tên → kiểm tra nội dung, một nút) | 2. Đổi tên & lưu | 3. Kiểm tra QĐXB
-- **4 tab** (`sxb_tool_4tab.py`, `SXBTool_4tab.exe`): 1. Quét kho | 2. Đối chiếu Excel | 3. Kiểm tra nội dung | 4. Đổi tên & lưu | 5. Kiểm tra QĐXB
+- **4 tab** (`sxb_tool_4tab.py`, chỉ chạy bằng Python, không build exe nữa): 1. Quét kho | 2. Đối chiếu Excel | 3. Kiểm tra nội dung | 4. Đổi tên & lưu | 5. Kiểm tra QĐXB
 
 Yêu cầu Python 3.9+ (đã thử 3.11) + `openpyxl`, `pymupdf`, `python-docx`, `pywin32` (đọc .doc qua Microsoft Word).
 
@@ -15,7 +15,7 @@ python -X utf8 sxb_tool.py --test   # tự kiểm tra
 
 ## Chạy bằng file .exe (không cần Python)
 Bấm đúp `build.bat`: tự tìm Python (biến `PYTHON` nếu đặt, rồi `py -3.11`, `py -3`, `python`), tự cài thư viện còn thiếu
-(cả `pyinstaller`), chạy tự kiểm tra, rồi build `dist\SXBTool.exe` (2 tab) và `dist\SXBTool_4tab.exe` (4 tab), mỗi file ~37 MB,
+(cả `pyinstaller`), chạy tự kiểm tra, rồi build `dist\SXBTool.exe` (2 tab), ~56 MB,
 copy đi máy khác chạy được ngay. Lần đầu mở mất vài giây vì exe tự giải nén. Nếu Windows Defender cảnh báo thì chọn
 "Run anyway" (exe PyInstaller chưa ký số). Hai bản dùng chung thư mục `ketqua/` và cache khi để cạnh nhau.
 
@@ -24,7 +24,7 @@ Build trên chính máy Ubuntu (PyInstaller không build chéo từ Windows sang
 ```bash
 bash build.sh
 ```
-`build.sh` tự cài gói còn thiếu (`python3-tk`, `python3-venv`, `antiword`, `catdoc`, `binutils`, `libpython3-dev` - cần sudo), tạo môi trường `.venv-linux`, cài thư viện, tự kiểm tra rồi tạo `dist-linux/SXBTool` (2 tab) và `dist-linux/SXBTool_4tab` (4 tab). Chạy: `./dist-linux/SXBTool` (cần `chmod +x` nếu chép từ Windows sang). File build trên Ubuntu 22.04 chạy được trên 22.04 và 24.04 (bản Ubuntu cũ hơn thì build lại trên chính máy đó). Không build cũng chạy được: `python3 sxb_tool.py` (hoặc `sxb_tool_4tab.py`).
+`build.sh` tự cài gói còn thiếu (`python3-tk`, `python3-venv`, `antiword`, `catdoc`, `binutils`, `libpython3-dev` - cần sudo), tạo môi trường `.venv-linux`, cài thư viện, tự kiểm tra rồi tạo `dist-linux/SXBTool` (2 tab). Chạy: `./dist-linux/SXBTool` (cần `chmod +x` nếu chép từ Windows sang). File build trên Ubuntu 22.04 chạy được trên 22.04 và 24.04 (bản Ubuntu cũ hơn thì build lại trên chính máy đó). Không build cũng chạy được: `python3 sxb_tool.py` (hoặc `sxb_tool_4tab.py`).
 
 Khác bản Windows: file `.doc` đọc bằng `antiword` (không có thì `catdoc`) thay cho Microsoft Word. Đường dẫn trong file kết quả là đường dẫn Linux (`/mnt/kho/...`), nên kết quả quét trên Linux dùng tiếp trên Linux.
 
@@ -33,7 +33,7 @@ Tool tự tạo `ketqua/` cạnh file exe (có thể đổi trong từng tab):
 - `1_quet_kho`: file kho `kho_*.xlsx` và cache kết quả đọc file `cache_noi_dung.sqlite` (dùng chung mọi lần chạy: file đã đọc không đọc lại)
 - `2_doi_chieu`: file kết quả `doi_chieu_*.xlsx` và bản Excel tổng hợp đánh dấu (dòng KHỚP tô vàng)
 - `3_doi_ten`: file kết quả sau khi đổi tên & lưu
-- `4_kiem_tra_qdxb`: báo cáo `kiem_tra_qdxb_*.xlsx` và Excel đánh dấu thêm cột Kiểm tra QĐXB (cache đọc ở `1_quet_kho/cache_qdxb.sqlite`)
+- `4_kiem_tra_qdxb`: báo cáo `kiem_tra_qdxb_*.xlsx` và Excel đánh dấu thêm cột Kiểm tra QĐXB (cache đọc ở `1_quet_kho/cache_qdxb_3.sqlite`, đổi số khi sửa cách đọc nên bản mới tự đọc lại)
 - `sach_da_luu`: thư mục đích mặc định khi đổi tên & lưu: mỗi sách một thư mục `Năm/thang MM/<tên mới>/<tên mới>.pdf|.docx`
 
 ## Quy trình
@@ -46,7 +46,7 @@ Nút **■ Dừng** (cuối cửa sổ) dừng bước đang chạy sau file hi�
    - *Lời nói đầu (KHÔNG TÌM THẤY)*: tìm câu "cuốn sách <tên sách>" trong lời nói đầu của các file còn lại trong kho.
    - Xuất `doi_chieu_*.xlsx`: sheet `KHOP`, `CAN_XU_LY`, `THU_MUC_KHO` (từng thư mục kho khớp sách nào / chỉ trùng tên / không khớp sách nào) và `CAN_OCR` (PDF không có lớp chữ - ảnh scan, chữ dạng hình vẽ - cần OCR mới đọc được; có cột ưu tiên). Bản sao Excel tổng hợp thêm 4 cột tình trạng, dòng KHỚP tô vàng.
 2. **Đổi tên & lưu**: copy/move file Word, PDF sang `Năm/thang MM/<tên mới>/`, mỗi sách một thư mục, theo tên mới `ten_sach_mmyy_R_BBT_T01` (phần tên sách tối đa 90 ký tự, hằng `DAI_TEN`). Phần `BBT` lấy theo cột "Mã quy định" (cột F) của `BBT_distinct.xlsx` (đặt cạnh Excel tổng hợp hoặc cạnh exe), khớp đúng giá trị cột J; dòng chưa điền mã thì dùng BBT bỏ dấu. File này được đọc lại mỗi lần đối chiếu, sửa mã xong chạy lại đối chiếu là có tên mới. File bìa cùng thư mục với file ruột - ảnh (.jpg, .png, .tif), file thiết kế (.ai, .psd, .eps), PDF 1-2 trang, PDF ≤ 8 trang có trang đầu nằm ngang (trải bìa + tai gập) hoặc PDF tên 'Bìa / Tờ che / Tr 2-4' - được chép vào `<tên mới>/Bia/`, tên đổi `_R_` (Ruột) thành `_B_` (Bìa), nhiều bìa cùng đuôi thì thêm `_2`, `_3`. PDF 1-2 trang không bao giờ được chọn làm ruột. Chạy lại được: file đã có thì bỏ qua; file lỗi ghi vào Ghi chú rồi làm tiếp; kiểm tra ổ đích đủ chỗ trước khi chép.
-3. **Kiểm tra QĐXB**: duyệt thư mục đích đã chép ở bước 2 (bỏ thư mục `Bia`), đọc "Quyết định xuất bản số ..., ngày 04-9-2013" và "nộp lưu chiểu tháng 9-2013" ở 3 trang cuối từng sách (không có thì ở 8 trang đầu), so với cột QĐXB của Excel: tháng + năm nếu Excel ghi `mm/yyyy`, cả ngày nếu `dd/mm/yyyy`. Mỗi thư mục gắn với dòng Excel theo cột "Đường dẫn đích", không có thì theo năm + tên thư mục. Kết quả `ĐÚNG` / `SAI - Excel 01/2013, file 04/09/2013` (tô cam) / `ĐÚNG THEO LƯU CHIỂU` (tô vàng nhạt: QĐXB lệch nhưng tháng nộp lưu chiểu khớp Excel - Excel đang ghi tháng có sách, không tự đổi tên) / `KHÔNG ĐỌC ĐƯỢC QĐXB` (tô xám) / `KHÔNG THẤY Ở THƯ MỤC ĐÍCH`; cột **Kiểm tra lưu chiểu** so tháng "In xong và nộp lưu chiểu" (tháng, quý hoặc chỉ năm; đọc được cả chữ lỗi font TCVN3) với Excel, kèm số QĐXB, tháng lưu chiểu, **tên mới theo ngày QĐXB trên file** và ghi chú khi hai dòng Excel ra cùng một QĐXB (thường do chép trùng một file). Nút **Quét & đánh dấu** chỉ đọc, không đổi gì trong thư mục đích. Chạy lại trên bản Excel đã đánh dấu thì ghi đè đúng các cột cũ.
+3. **Kiểm tra QĐXB**: duyệt thư mục đích đã chép ở bước 2 (bỏ thư mục `Bia`), đọc "Quyết định xuất bản số ..., ngày 04-9-2013" và "nộp lưu chiểu tháng 9-2013" ở 3 trang cuối từng sách (không có thì ở 8 trang đầu), so với cột QĐXB của Excel: tháng + năm nếu Excel ghi `mm/yyyy`, cả ngày nếu `dd/mm/yyyy`. Mỗi thư mục gắn với dòng Excel theo cột "Đường dẫn đích", không có thì theo năm + tên thư mục. Kết quả `ĐÚNG` / `SAI - Excel 01/2013, file 04/09/2013` (tô cam) / `ĐÚNG THEO LƯU CHIỂU` (tô vàng nhạt: QĐXB lệch nhưng tháng nộp lưu chiểu khớp Excel - Excel đang ghi tháng có sách, không tự đổi tên) / `KHÔNG ĐỌC ĐƯỢC QĐXB` (tô xám) / `KHÔNG THẤY Ở THƯ MỤC ĐÍCH`; cột **Kiểm tra lưu chiểu** so tháng "In xong và nộp lưu chiểu" (tháng, quý hoặc chỉ năm; đọc được cả chữ lỗi font TCVN3) với Excel. QĐXB và lưu chiểu đọc được cả PDF xuất từ QuarkXPress dùng font bảng mã cũ (TCVN3, VNI và bảng mã 'Quyïët àõnh xuêët baãn' của sổ tay đảng viên 2013); vẫn không đọc được thì cột **Chữ cuối sách** của báo cáo cho thấy chữ lấy ra được, kèm số QĐXB, tháng lưu chiểu, **tên mới theo ngày QĐXB trên file** và ghi chú khi hai dòng Excel ra cùng một QĐXB (thường do chép trùng một file). Nút **Quét & đánh dấu** chỉ đọc, không đổi gì trong thư mục đích. Chạy lại trên bản Excel đã đánh dấu thì ghi đè đúng các cột cũ.
    - **Chạy thử đổi tên** / **Đổi tên theo QĐXB**: sách SAI được chuyển sang `<Năm>/thang <tháng QĐXB trên file>/<tên mới theo QĐXB>` (đổi tên trên cùng ổ, không chép lại), file ruột và file bìa `_B_` đổi theo tên mới, thư mục tháng cũ rỗng thì xoá. Không tự đổi, chỉ ghi chú để xem tay: năm QĐXB khác năm Excel (thường là khớp nhầm sách), nhiều dòng cùng một QĐXB (chép trùng một file: chỉ đổi dòng đầu; có dòng ĐÚNG cùng QĐXB thì không đổi dòng nào). Hỏi xác nhận trước khi đổi; tool không tự hoàn tác. Sau khi đổi: ô Kiểm tra QĐXB tô xanh, Excel đánh dấu nhận Tên file mới + Đường dẫn đích mới, và có **file doi_chieu mới** trong `3_doi_ten` (QĐXB, tên, đường dẫn theo file) - dùng file này khi chạy lại Đổi tên & lưu để không chép lại vào chỗ cũ.
    - Lưu ý năm 2013: Excel gốc không có cột QĐXB, cột ở vị trí đó là "Thời gian có sách" (bản chuẩn hoá gộp vào cột QĐXB), nên năm 2013 sẽ có nhiều dòng SAI dù sách đúng.
 

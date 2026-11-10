@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Build Tool SXB cho Ubuntu: dist-linux/SXBTool (bản 2 tab) và dist-linux/SXBTool_4tab (bản 4 tab).
+# Build Tool SXB cho Ubuntu: dist-linux/SXBTool (bản 2 tab). Bản 4 tab không build nữa (vẫn chạy được: python3 sxb_tool_4tab.py).
 # Tự cài gói hệ thống còn thiếu (cần sudo), tạo môi trường Python riêng (.venv-linux), cài thư viện, tự kiểm tra rồi build.
 # Chạy: bash build.sh      (muốn dùng Python cụ thể: PYTHON=/usr/bin/python3.11 bash build.sh)
 set -euo pipefail
 cd "$(dirname "$0")"
-echo "=== Build Tool SXB (Linux): SXBTool (2 tab) và SXBTool_4tab (4 tab) ==="
+echo "=== Build Tool SXB (Linux): SXBTool (2 tab) ==="
 
 # 1. Gói hệ thống: python3 + venv + tkinter (giao diện), antiword/catdoc (đọc .doc - Linux không có Word),
 #    binutils + libpython3-dev (PyInstaller cần objdump và libpython3.x.so)
@@ -34,7 +34,7 @@ echo "Tự kiểm tra (sxb_tool.py --test)..."
 "$V" -X utf8 sxb_tool.py --test
 
 # 4. Build
-for x in "SXBTool sxb_tool.py" "SXBTool_4tab sxb_tool_4tab.py"; do
+for x in "SXBTool sxb_tool.py"; do
     set -- $x
     echo "Build dist-linux/$1..."
     "$V" -m PyInstaller --noconfirm --onefile --windowed --log-level WARN --name "$1" \
@@ -42,11 +42,10 @@ for x in "SXBTool sxb_tool.py" "SXBTool_4tab sxb_tool_4tab.py"; do
 done
 
 # 5. Kiểm tra lại chính file vừa build (--test không mở giao diện)
-for e in SXBTool SXBTool_4tab; do
+for e in SXBTool; do
     "dist-linux/$e" --test; echo "  dist-linux/$e --test: OK"
 done
 echo
 echo "=== XONG ==="
 echo "  dist-linux/SXBTool      : bản 2 tab (Đối chiếu | Đổi tên & lưu)"
-echo "  dist-linux/SXBTool_4tab : bản 4 tab (Quét kho | Đối chiếu Excel | Kiểm tra nội dung | Đổi tên & lưu)"
 echo "  Chạy: ./dist-linux/SXBTool  (đặt 'Tong hop SXB 2006-2025_chuan.xlsx' và BBT_distinct.xlsx cạnh file chạy hoặc thư mục cha)"

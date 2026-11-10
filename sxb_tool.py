@@ -1275,22 +1275,54 @@ def luu_file(kh, di_chuyen=False, progress=None):
 # ---------- kiểm tra QĐXB ở thư mục đích ----------
 _NGAY = r"(\d{1,2})\s*(?:[-/.]|thang)\s*(\d{1,2})\s*(?:[-/.]|nam)\s*((?:19|20)\d\d)"
 QD_RE = re.compile(r"(?:(?:quyet\s*dinh|giay\s*phep)\s*xuat\s*ban|qdxb)\s*(?:so)?\s*:?\s*(.{0,40}?)[\s,;:.]*(?:cap\s*)?ngay\s*" + _NGAY, re.I)
-# 'nộp lưu chiểu tháng 9-2013' / 'quý III năm 2013' / 'năm 2013'; chấp nhận chữ lỗi font TCVN3 ('noap lou chieau thaung')
-LC_RE = re.compile(r"n\w{0,2}p\s*l\w{0,2}u\s*chi\w{0,3}u\s*:?\s*(?:th\w{0,3}ng\s*(\d{1,2})\s*(?:[-/.]|n\w{0,2}m)\s*((?:19|20)\d\d)"
+# 'nộp lưu chiểu tháng 9-2013' / 'quý III năm 2013' / 'năm 2013'; chấp nhận chữ lỗi font TCVN3 ('noap lou chieau thaung'),
+# và 'l-u': chữ 'ư' TCVN3 là mã soft hyphen, thư viện đọc PDF trả về dấu '-'
+LC_RE = re.compile(r"n\w{0,2}p\s*l[\w-]{0,2}u\s*chi\w{0,3}u\s*:?\s*(?:th\w{0,3}ng\s*(\d{1,2})\s*(?:[-/.]|n\w{0,2}m)\s*((?:19|20)\d\d)"
                    r"|qu\w{0,2}\s*([ivx]+|\d)\s*(?:[-/.]|n\w{0,2}m)\s*((?:19|20)\d\d)|(?:n\w{0,2}m\s*)?((?:19|20)\d\d))", re.I)
 COT_QD = [("nam", "Năm"), ("dong", "Dòng Excel"), ("ten", "Tên sách"), ("qdxb", "QĐXB Excel"), ("kiem", "Kiểm tra QĐXB"),
           ("ngay", "Ngày QĐXB (file)"), ("so", "Số QĐXB (file)"), ("luu_chieu", "Nộp lưu chiểu (file)"),
           ("kiem_lc", "Kiểm tra lưu chiểu"), ("noi", "Đọc ở"),
           ("ten_moi", "Tên file mới (hiện tại)"), ("ten_moi_qd", "Tên mới theo QĐXB file"), ("ghi_chu", "Ghi chú"),
-          ("file", "File đọc"), ("thu_muc", "Thư mục đích"), ("thu_muc_moi", "Thư mục sau đổi tên")]
+          ("file", "File đọc"), ("thu_muc", "Thư mục đích"), ("thu_muc_moi", "Thư mục sau đổi tên"),
+          ("mau", "Chữ cuối sách (khi không đọc được)")]
 QD_DUNG, QD_SAI, QD_KHONG, QD_CHUA = "ĐÚNG", "SAI", "KHÔNG ĐỌC ĐƯỢC QĐXB", "KHÔNG THẤY Ở THƯ MỤC ĐÍCH"
 QD_DA_DOI = "ĐÃ ĐỔI TÊN"
+QD_CACHE = "cache_qdxb_3.sqlite"  # đổi số khi sửa cách đọc QĐXB / lưu chiểu: kết quả cũ trong cache không dùng lại
+
+
+# PDF xuất từ QuarkXPress / PageMaker cũ dùng font bảng mã TCVN3 (.VnTime) hoặc VNI: chữ hiện đúng trên màn hình nhưng
+# chữ lấy ra là 'QuyÕt ®Þnh xuÊt b¶n' (TCVN3) / 'Quyeát ñònh xuaát baûn' (VNI). Hai bảng dưới đưa về chữ không dấu.
+_TCVN3 = str.maketrans({c: b for b, cs in (("a", "¸µ¶·¹¨¾»¼½Æ©ÊÇÈÉË"), ("d", "®"), ("e", "ÐÌÎÏÑªÕÒÓÔÖ"), ("i", "Ý×ØÜÞ"),
+                                           ("o", "ãßáâä«èåæçé¬íêëìî"), ("u", "óïñòô\xadøõö÷ù"), ("y", "ýúûüþ"),
+                                           ("A", "¡¢"), ("D", "§"), ("E", "£"), ("O", "¤¥"), ("U", "¦"))
+                        for c in cs})
+_VNI = str.maketrans({**{c: b for b, cs in (("d", "ñ"), ("D", "Ñ"), ("o", "ô"), ("O", "Ô"), ("u", "ö"), ("U", "Ö"),
+                                            ("i", "òæóíì"), ("I", "ÒÆÓÍÌ")) for c in cs},
+                      **{c: None for c in "ùøûõïâêáàåãäéèúüëÙØÛÕÏÂÊÁÀÅÃÄÉÈÚÜË"}})  # dấu thanh, mũ, trăng: bỏ
+# Bảng mã thứ ba (PDF QuarkXPress của NXB, vd sổ tay đảng viên 2013): 'Quyïët àõnh xuêët baãn söë ..., ngaây' = 'Quyết định
+# xuất bản số ..., ngày'; 'nöåp lûu chiïíu thaáng' = 'nộp lưu chiểu tháng'. Dựng từ chữ trang cuối thật, chỉ gồm ký tự đã gặp.
+_VN3 = str.maketrans({**{c: b for b, cs in (("a", "êù"), ("e", "ï"), ("o", "öú"), ("u", "û"), ("d", "à"), ("i", "òñóõ"),
+                                            ("O", "Ú"), ("U", "Û"), ("D", "À")) for c in cs},
+                      **{c: None for c in "áâãåëìíîÁ"}})
 
 
 def doc_qdxb(text):
     """Chữ trang cuối / đầu sách -> {'so': '3636-QD/NXBCTQG', 'ngay': '04/09/2013', 'luu_chieu': '09/2013'}, thiếu thì ''.
     Nhận 'Quyết định / Giấy phép xuất bản số ..., ngày 04-9-2013' hoặc 'ngày 04 tháng 9 năm 2013', 'QĐXB số ...';
-    lưu chiểu 'nộp lưu chiểu tháng 9-2013' hoặc 'quý III năm 2013'. Nhiều khối thì lấy khối cuối."""
+    lưu chiểu 'nộp lưu chiểu tháng 9-2013' hoặc 'quý III năm 2013'. Nhiều khối thì lấy khối cuối.
+    Thử lần lượt chữ Unicode, TCVN3, VNI (không cần biết trước file dùng bảng mã nào), mỗi mục lấy cách đầu tiên đọc ra."""
+    q = dict(so="", ngay="", luu_chieu="")
+    for bang in (None, _TCVN3, _VNI, _VN3):
+        x = _doc_qdxb_1(text.translate(bang) if bang and text else text)
+        if x["ngay"] and not q["ngay"]:
+            q.update(so=x["so"], ngay=x["ngay"])
+        q["luu_chieu"] = q["luu_chieu"] or x["luu_chieu"]
+        if q["ngay"] and q["luu_chieu"]:
+            break
+    return q
+
+
+def _doc_qdxb_1(text):
     t = re.sub(r"\s+", " ", khong_dau(text or ""))
     q = dict(so="", ngay="", luu_chieu="")
     m = list(QD_RE.finditer(t))
@@ -1364,6 +1396,8 @@ def trich_qdxb(path):
     qc, qd = doc_qdxb(cuoi), doc_qdxb(dau)
     q = {k: qc[k] or qd[k] for k in qc}
     q["noi"] = "trang cuối" if qc["ngay"] else "8 trang đầu" if qd["ngay"] else ""
+    # thiếu QĐXB hoặc lưu chiểu: giữ 300 ký tự cuối sách để người xem biết vì sao (trang trắng, PDF scan, font lạ...)
+    q["mau"] = "" if q["ngay"] and q["luu_chieu"] else (re.sub(r"\s+", " ", cuoi).strip()[-300:] or "(trang cuối không có chữ - PDF scan?)")
     return q
 
 
@@ -1433,13 +1467,15 @@ def bao_cao_qdxb(kq, theo_dong, la, doc):
         ps = sorted(theo_dong.get(i, []), key=lambda p: not p.lower().endswith(".pdf"))
         if not ps and r.get("tinh_trang") != "KHỚP":
             continue
-        q, nguon = dict(so="", ngay="", luu_chieu="", noi=""), ""
+        q, nguon, mo = dict(so="", ngay="", luu_chieu="", noi="", mau=""), "", 0
         for p in ps:
             x = doc(p) or {}
+            mo += bool(x)
             for k in q:
                 if not q[k] and x.get(k):
                     q[k] = x[k]
                     nguon = nguon or (p if k == "ngay" else "")
+        q["mau"] = "" if q["ngay"] and q["luu_chieu"] else q["mau"] or ("(không mở được file)" if ps and not mo else "")
         kiem, moi = kiem_qdxb(r, q) if ps else (QD_CHUA, "")
         kiem_lc = kiem_luu_chieu(r.get("qdxb"), q["luu_chieu"]) if ps else ""
         if kiem_lc == "ĐÚNG" and kiem.startswith((QD_SAI, QD_KHONG)):
@@ -1481,7 +1517,7 @@ def ghi_qdxb(bc, xlsx_danh_dau, thu_muc_ra):
         for cot, k in ((5, "kiem"), (9, "kiem_lc")):
             if mau(b.get(k, "")):
                 ws.cell(ws.max_row, cot).fill = mau(b[k])
-    for c, w in zip("ABCDEFGHIJKLMNOP", (6, 8, 50, 11, 40, 13, 22, 13, 40, 11, 45, 45, 30, 60, 60, 60)):
+    for c, w in zip("ABCDEFGHIJKLMNOPQ", (6, 8, 50, 11, 40, 13, 22, 13, 40, 11, 45, 45, 30, 60, 60, 60, 80)):
         ws.column_dimensions[c].width = w
     for c in ws[1]:
         c.font = Font(bold=True)
@@ -2073,7 +2109,7 @@ def gui(so_tab=2):
         theo_dong, la = quet_dich(dich, kq)
         ps = sorted({p for v in theo_dong.values() for p in v})
         log(f"Thư mục đích: {len(ps)} file Word/PDF gắn với {len(theo_dong)} dòng Excel, {len(la)} file không gắn được dòng nào")
-        cache = Cache(os.path.join(TM["1_quet_kho"], "cache_qdxb.sqlite"))
+        cache = Cache(os.path.join(TM["1_quet_kho"], QD_CACHE))
         try:
             nhan = f"Đọc QĐXB trang cuối - {SO_LUONG} tiến trình"
             try:
@@ -2601,6 +2637,14 @@ def _test_qdxb():
     assert doc_qdxb("In xong và nộp lưu chiểu năm 2013.")["luu_chieu"] == "2013"
     assert doc_qdxb("In xong vaø noäp löu chieåu thaùng 9 naêm 2013.")["luu_chieu"] == "09/2013"  # chữ lỗi font TCVN3
     assert doc_qdxb("In xong, nộp lưu chiểu: tháng 13-2013")["luu_chieu"] == ""
+    ket = dict(so="3636-QD/NXBCTQG", ngay="04/09/2013", luu_chieu="09/2013")
+    VNI = ("Soá ñaêng kyù keá hoaïch xuaát baûn: 1019-2013/CXB/26-43/CTQG.\nQuyeát ñònh xuaát baûn soá: 3636-QÑ/NXBCTQG, "
+           "ngaøy 04-9-2013.\nIn xong vaø noäp löu chieåu thaùng 9-2013.")
+    TCVN3 = "QuyÕt ®Þnh xuÊt b¶n sè: 3636-Q§/NXBCTQG, ngµy 04-9-2013.\nIn xong vµ nép l\xadu chiÓu th¸ng 9-2013."
+    assert doc_qdxb(VNI) == ket and doc_qdxb(TCVN3) == ket  # PDF QuarkXPress font VNI / .VnTime
+    VN3 = ("Söë àùng kyá kïë hoaåch xuêët baãn: 1019-2013/CXB/26-43/CTQg. Quyïët àõnh xuêët baãn söë: 3636-QÀ/NXBCTQg, "
+           "ngaây 04-9-2013. in xong vaâ nöåp lûu chiïíu thaáng 9-2013.")  # chữ thật trang cuối sổ tay đảng viên 2013
+    assert doc_qdxb(VN3) == dict(ket, so="3636-QD/NXBCTQg")
     assert kiem_luu_chieu("09/2013", "09/2013") == "ĐÚNG" and kiem_luu_chieu("04/09/2013", "09/2013") == "ĐÚNG"
     assert kiem_luu_chieu("08/2013", "Quý III/2013") == "ĐÚNG" and kiem_luu_chieu("10/2013", "Quý III/2013").startswith(QD_SAI)
     assert kiem_luu_chieu("01/2013", "09/2013") == "SAI - Excel 01/2013, file 09/2013"
@@ -2610,6 +2654,18 @@ def _test_qdxb():
     b, = bao_cao_qdxb([r], {0: ["a.pdf"]}, [], lambda p: dict(so="1", ngay="04/09/2013", luu_chieu="10/2013", noi="trang cuối"))
     assert b["kiem"] == "ĐÚNG THEO LƯU CHIỂU (QĐXB file 04/09/2013)" and b["kiem_lc"] == "ĐÚNG" and ke_hoach_doi_qdxb([b], "x") == []
     tq = tempfile.mkdtemp(); dich = os.path.join(tq, "dich")
+    for ten, chu in (("vni.pdf", VNI), ("trang.pdf", "Muc luc 201"), ("tcvn3.pdf", TCVN3)):  # chữ VNI/TCVN3 đúng như lấy ra từ PDF
+        with fitz.open() as f:
+            f.new_page().insert_text((50, 72), "Trang 1")
+            y = 72
+            for dong in chu.split("\n"):
+                f[-1].insert_text((50, y + 40), dong); y += 20
+            f.save(os.path.join(tq, ten))
+    for ten in ("vni.pdf", "tcvn3.pdf"):
+        q = trich_qdxb(os.path.join(tq, ten))
+        assert {k: q[k] for k in ket} == ket and q["noi"] == "trang cuối" and q["mau"] == "", (ten, q)
+    q = trich_qdxb(os.path.join(tq, "trang.pdf"))
+    assert q["ngay"] == "" and q["mau"].endswith("Muc luc 201")
 
     def sach(nam, thang, ten, chu, duoi=".pdf", bia=False):
         d = os.path.join(dich, nam, f"thang {thang}", ten); os.makedirs(os.path.join(d, "Bia"), exist_ok=True)

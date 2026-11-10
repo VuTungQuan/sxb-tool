@@ -1,11 +1,11 @@
 @echo off
-REM Build Tool SXB: dist\SXBTool.exe (ban 2 tab) va dist\SXBTool_4tab.exe (ban 4 tab).
+REM Build Tool SXB: dist\SXBTool.exe (ban 2 tab). Ban 4 tab khong build nua (van chay duoc: python sxb_tool_4tab.py).
 REM Tu tim Python, tu cai thu vien con thieu, chay tu kiem tra roi moi build.
 REM Muon dung Python cu the: set PYTHON="C:\duong dan\python.exe" roi chay build.bat
 setlocal
 cd /d "%~dp0"
 title Build Tool SXB
-echo === Build Tool SXB: SXBTool.exe (2 tab) va SXBTool_4tab.exe (4 tab) ===
+echo === Build Tool SXB: SXBTool.exe (2 tab) ===
 echo.
 
 REM ---- 1. Tim Python 3.9 tro len: bien PYTHON ^> py -3.11 ^> py -3 ^> python
@@ -44,13 +44,9 @@ REM ---- 4. Build 2 ban exe
 echo Build dist\SXBTool.exe (2 tab)...
 %PY% -m PyInstaller --noconfirm --onefile --noconsole --log-level WARN --name SXBTool --distpath dist --workpath build\work --specpath build sxb_tool.py
 if errorlevel 1 goto loi_build
-echo Build dist\SXBTool_4tab.exe (4 tab)...
-%PY% -m PyInstaller --noconfirm --onefile --noconsole --log-level WARN --name SXBTool_4tab --distpath dist --workpath build\work --specpath build sxb_tool_4tab.py
-if errorlevel 1 goto loi_build
 echo.
 echo === XONG ===
 echo   dist\SXBTool.exe      : ban 2 tab (Doi chieu ^| Doi ten ^& luu)
-echo   dist\SXBTool_4tab.exe : ban 4 tab (Quet kho ^| Doi chieu Excel ^| Kiem tra noi dung ^| Doi ten ^& luu)
 pause
 exit /b 0
 
