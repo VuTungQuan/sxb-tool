@@ -1275,9 +1275,12 @@ def luu_file(kh, di_chuyen=False, progress=None):
 # ---------- kiểm tra QĐXB ở thư mục đích ----------
 _NGAY = r"(\d{1,2})\s*(?:[-/.]|thang)\s*(\d{1,2})\s*(?:[-/.]|nam)\s*((?:19|20)\d\d)"
 QD_RE = re.compile(r"(?:(?:quyet\s*dinh|giay\s*phep)\s*xuat\s*ban|qdxb)\s*(?:so)?\s*:?\s*(.{0,40}?)[\s,;:.]*(?:cap\s*)?ngay\s*" + _NGAY, re.I)
-LC_RE = re.compile(r"nop\s*luu\s*chieu\s*:?\s*(?:thang\s*(\d{1,2})\s*(?:[-/.]|nam)\s*((?:19|20)\d\d)|quy\s*([ivx\d]+)\s*(?:[-/.]|nam)\s*((?:19|20)\d\d))", re.I)
+# 'nộp lưu chiểu tháng 9-2013' / 'quý III năm 2013' / 'năm 2013'; chấp nhận chữ lỗi font TCVN3 ('noap lou chieau thaung')
+LC_RE = re.compile(r"n\w{0,2}p\s*l\w{0,2}u\s*chi\w{0,3}u\s*:?\s*(?:th\w{0,3}ng\s*(\d{1,2})\s*(?:[-/.]|n\w{0,2}m)\s*((?:19|20)\d\d)"
+                   r"|qu\w{0,2}\s*([ivx]+|\d)\s*(?:[-/.]|n\w{0,2}m)\s*((?:19|20)\d\d)|(?:n\w{0,2}m\s*)?((?:19|20)\d\d))", re.I)
 COT_QD = [("nam", "Năm"), ("dong", "Dòng Excel"), ("ten", "Tên sách"), ("qdxb", "QĐXB Excel"), ("kiem", "Kiểm tra QĐXB"),
-          ("ngay", "Ngày QĐXB (file)"), ("so", "Số QĐXB (file)"), ("luu_chieu", "Nộp lưu chiểu (file)"), ("noi", "Đọc ở"),
+          ("ngay", "Ngày QĐXB (file)"), ("so", "Số QĐXB (file)"), ("luu_chieu", "Nộp lưu chiểu (file)"),
+          ("kiem_lc", "Kiểm tra lưu chiểu"), ("noi", "Đọc ở"),
           ("ten_moi", "Tên file mới (hiện tại)"), ("ten_moi_qd", "Tên mới theo QĐXB file"), ("ghi_chu", "Ghi chú"),
           ("file", "File đọc"), ("thu_muc", "Thư mục đích"), ("thu_muc_moi", "Thư mục sau đổi tên")]
 QD_DUNG, QD_SAI, QD_KHONG, QD_CHUA = "ĐÚNG", "SAI", "KHÔNG ĐỌC ĐƯỢC QĐXB", "KHÔNG THẤY Ở THƯ MỤC ĐÍCH"
@@ -1297,9 +1300,41 @@ def doc_qdxb(text):
             q.update(so=re.sub(r"^so\s*:?\s*", "", so.strip(" ,;:."), flags=re.I), ngay=f"{int(d):02d}/{int(mo):02d}/{y}")
     m = list(LC_RE.finditer(t))
     if m:
-        th, y, quy, y2 = m[-1].groups()
-        q["luu_chieu"] = f"{int(th):02d}/{y}" if th else f"Quý {quy.upper()}/{y2}"
+        th, y, quy, y2, y3 = m[-1].groups()
+        if th and 1 <= int(th) <= 12:
+            q["luu_chieu"] = f"{int(th):02d}/{y}"
+        elif quy and _quy(quy):
+            q["luu_chieu"] = f"Quý {quy.upper()}/{y2}"
+        elif y3:
+            q["luu_chieu"] = y3
     return q
+
+
+def _quy(s):
+    """'III' / '3' -> 3; không phải quý 1-4 -> 0."""
+    s = s.upper()
+    n = int(s) if s.isdigit() else {"I": 1, "II": 2, "III": 3, "IV": 4}.get(s, 0)
+    return n if 1 <= n <= 4 else 0
+
+
+QD_LC = "ĐÚNG THEO LƯU CHIỂU"
+
+
+def kiem_luu_chieu(qdxb, lc):
+    """Cột QĐXB Excel so với tháng nộp lưu chiểu trên file -> 'ĐÚNG' / 'ĐÚNG NĂM (file chỉ ghi năm)' /
+    'SAI - Excel 01/2013, file 09/2013' / 'KHÔNG ĐỌC ĐƯỢC LƯU CHIỂU'. Lưu chiểu theo quý: đúng nếu tháng Excel thuộc quý đó."""
+    if not lc:
+        return "KHÔNG ĐỌC ĐƯỢC LƯU CHIỂU"
+    e = [int(x) for x in re.findall(r"\d+", str(qdxb or ""))]
+    if len(e) < 2:
+        return f"{QD_SAI} - Excel trống, file {lc}" if not e else f"{QD_SAI} - Excel {qdxb}, file {lc}"
+    thang, nam = e[-2], e[-1] % 100
+    y = int(lc[-4:]) % 100
+    if "/" not in lc:  # file chỉ ghi năm
+        return "ĐÚNG NĂM (file chỉ ghi năm)" if y == nam else f"{QD_SAI} - Excel {qdxb}, file {lc}"
+    thang_lc = range(3 * _quy(lc[4:].split("/")[0]) - 2, 3 * _quy(lc[4:].split("/")[0]) + 1) if lc.startswith("Quý") \
+        else [int(lc[:2])]
+    return "ĐÚNG" if y == nam and thang in thang_lc else f"{QD_SAI} - Excel {qdxb}, file {lc}"
 
 
 def trich_qdxb(path):
@@ -1406,7 +1441,12 @@ def bao_cao_qdxb(kq, theo_dong, la, doc):
                     q[k] = x[k]
                     nguon = nguon or (p if k == "ngay" else "")
         kiem, moi = kiem_qdxb(r, q) if ps else (QD_CHUA, "")
-        bc.append(dict(q, i=i, nam=r["nam"], dong=r["dong"], ten=r["ten"], qdxb=r.get("qdxb", ""), kiem=kiem,
+        kiem_lc = kiem_luu_chieu(r.get("qdxb"), q["luu_chieu"]) if ps else ""
+        if kiem_lc == "ĐÚNG" and kiem.startswith((QD_SAI, QD_KHONG)):
+            # Excel ghi tháng nộp lưu chiểu / có sách (vd cột 'Thời gian có sách' năm 2013) chứ không phải ngày QĐXB:
+            # sách đúng, không tự đổi tên
+            kiem = f"{QD_LC} (QĐXB file {q['ngay']})" if q["ngay"] else f"{QD_LC} (không đọc được QĐXB)"
+        bc.append(dict(q, i=i, nam=r["nam"], dong=r["dong"], ten=r["ten"], qdxb=r.get("qdxb", ""), kiem=kiem, kiem_lc=kiem_lc,
                        ten_moi=r["ten_moi"], ten_moi_qd=moi, ghi_chu="", file=nguon or (ps[0] if ps else ""),
                        thu_muc=os.path.dirname(ps[0]) if ps else ""))
     trung = defaultdict(list)
@@ -1418,7 +1458,8 @@ def bao_cao_qdxb(kq, theo_dong, la, doc):
             b["ghi_chu"] = "cùng QĐXB với " + ", ".join(f"năm {x['nam']} dòng {x['dong']}" for x in ds if x is not b)
     bc += [dict(nam="", dong="", ten="", qdxb="", kiem="THƯ MỤC KHÔNG KHỚP DÒNG EXCEL NÀO", file=p,
                 thu_muc=os.path.dirname(p)) for p in la]
-    thu_tu = lambda b: (0 if b["kiem"].startswith(QD_SAI) else 1 if b["kiem"].startswith(QD_KHONG) else 3 if b["kiem"] == QD_DUNG else 2)
+    thu_tu = lambda b: (0 if b["kiem"].startswith(QD_SAI) else 1 if b["kiem"].startswith(QD_KHONG) else
+                        3 if b["kiem"].startswith(QD_LC) else 4 if b["kiem"] == QD_DUNG else 2)
     return sorted(bc, key=thu_tu)
 
 
@@ -1430,15 +1471,17 @@ def ghi_qdxb(bc, xlsx_danh_dau, thu_muc_ra):
     os.makedirs(thu_muc_ra, exist_ok=True)
     tem = dt.datetime.now().strftime("%Y%m%d_%H%M")
     mau = lambda k: PatternFill("solid", fgColor="F4B183" if k.startswith(QD_SAI) else "C6EFCE" if k.startswith(QD_DA_DOI)
-                                else "D9D9D9") if k.startswith((QD_SAI, QD_KHONG, QD_DA_DOI)) else None
+                                else "FFF2CC" if k.startswith(QD_LC) else "D9D9D9") \
+        if k.startswith((QD_SAI, QD_KHONG, QD_DA_DOI, QD_LC)) else None
 
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "KIEM_TRA_QDXB"
     ws.append([h for _, h in COT_QD])
     for b in bc:
         ws.append([_cell(b.get(k, "")) for k, _ in COT_QD])
-        if mau(b["kiem"]):
-            ws.cell(ws.max_row, 5).fill = mau(b["kiem"])
-    for c, w in zip("ABCDEFGHIJKLMNO", (6, 8, 50, 11, 40, 13, 22, 13, 11, 45, 45, 30, 60, 60, 60)):
+        for cot, k in ((5, "kiem"), (9, "kiem_lc")):
+            if mau(b.get(k, "")):
+                ws.cell(ws.max_row, cot).fill = mau(b[k])
+    for c, w in zip("ABCDEFGHIJKLMNOP", (6, 8, 50, 11, 40, 13, 22, 13, 40, 11, 45, 45, 30, 60, 60, 60)):
         ws.column_dimensions[c].width = w
     for c in ws[1]:
         c.font = Font(bold=True)
@@ -1446,7 +1489,8 @@ def ghi_qdxb(bc, xlsx_danh_dau, thu_muc_ra):
     ra1 = os.path.join(thu_muc_ra, f"kiem_tra_qdxb_{tem}.xlsx")
     wb.save(ra1)
 
-    them = ["Kiểm tra QĐXB", "Ngày QĐXB (file)", "Số QĐXB (file)", "Nộp lưu chiểu (file)", "Tên mới theo QĐXB file"]
+    them = ["Kiểm tra QĐXB", "Ngày QĐXB (file)", "Số QĐXB (file)", "Nộp lưu chiểu (file)", "Kiểm tra lưu chiểu",
+            "Tên mới theo QĐXB file"]
     wb = openpyxl.load_workbook(xlsx_danh_dau)
     theo_nam = defaultdict(list)
     for b in bc:
@@ -1464,8 +1508,9 @@ def ghi_qdxb(bc, xlsx_danh_dau, thu_muc_ra):
         cot_dich = tieu_de.index("Đường dẫn đích") + 1 if "Đường dẫn đích" in tieu_de else 0
         cot_ten = tieu_de.index("Tên file mới") + 1 if "Tên file mới" in tieu_de else 0
         for b in bs:
-            for j, k in enumerate(("kiem", "ngay", "so", "luu_chieu", "ten_moi_qd")):
+            for j, k in enumerate(("kiem", "ngay", "so", "luu_chieu", "kiem_lc", "ten_moi_qd")):
                 ws.cell(int(b["dong"]), c0 + j, b.get(k, "") or None)
+            ws.cell(int(b["dong"]), c0 + 4).fill = mau(b.get("kiem_lc", "")) or PatternFill()
             if b.get("thu_muc_moi"):  # đã đổi tên: cột của bước đổi tên & lưu theo tên, đường dẫn mới
                 cot_dich and ws.cell(int(b["dong"]), cot_dich, _cell(b["dich_moi"]))
                 cot_ten and ws.cell(int(b["dong"]), cot_ten, b["ten_moi_qd"])
@@ -1495,7 +1540,7 @@ def ke_hoach_doi_qdxb(bc, thu_muc_dich):
         cung, phan = nhom[(b["so"], b["ngay"])], os.path.relpath(b["thu_muc"], thu_muc_dich).split(os.sep)
         bo = ("không lập được tên mới (Tên file mới không có _R_)" if not b.get("ten_moi_qd") else
               "năm QĐXB khác năm Excel" if b["ngay"][-4:] != str(b["nam"]) else
-              "trùng QĐXB với dòng khác" if any(x["kiem"] == QD_DUNG for x in cung) or
+              "trùng QĐXB với dòng khác" if any(x["kiem"].startswith(QD_DUNG) for x in cung) or
               next(x for x in cung if x["kiem"].startswith(QD_SAI)) is not b else
               "thư mục không có dạng Năm/thang MM/<tên>" if len(phan) != 3 or not re.fullmatch(r"(?:19|20)\d\d", phan[0]) else "")
         if bo:
@@ -2014,7 +2059,7 @@ def gui(so_tab=2):
                        "Đổi tên theo QĐXB: sách SAI được chuyển sang đúng thư mục tháng QĐXB, đổi tên file ruột và bìa.",
               justify="left").grid(row=4, column=0, columnspan=3, sticky="w", pady=4)
     pb5, lb5, tt5 = khung(t5, 6)
-    loai = lambda k: next((x for x in (QD_DA_DOI, QD_SAI, QD_KHONG) if k.startswith(x)), k)
+    loai = lambda k: next((x for x in (QD_DA_DOI, QD_SAI, QD_KHONG, QD_LC) if k.startswith(x)), k)
 
     def kiem_qd(che_do="danh_dau"):
         """che_do: 'danh_dau' (chỉ đánh dấu) | 'thu' (liệt kê sẽ đổi tên gì, không đổi) | 'doi' (đổi tên rồi đánh dấu)."""
@@ -2553,6 +2598,17 @@ def _test_qdxb():
     assert doc_qdxb("QĐXB số 12/QĐ-NXBCTQG ngày 15 tháng 5 năm 2020. Nộp lưu chiểu quý II năm 2020") == \
         dict(so="12/QD-NXBCTQG", ngay="15/05/2020", luu_chieu="Quý II/2020")
     assert doc_qdxb("Mục lục ... Luật năm 2013, ngày 04-9-2013") == dict(so="", ngay="", luu_chieu="")
+    assert doc_qdxb("In xong và nộp lưu chiểu năm 2013.")["luu_chieu"] == "2013"
+    assert doc_qdxb("In xong vaø noäp löu chieåu thaùng 9 naêm 2013.")["luu_chieu"] == "09/2013"  # chữ lỗi font TCVN3
+    assert doc_qdxb("In xong, nộp lưu chiểu: tháng 13-2013")["luu_chieu"] == ""
+    assert kiem_luu_chieu("09/2013", "09/2013") == "ĐÚNG" and kiem_luu_chieu("04/09/2013", "09/2013") == "ĐÚNG"
+    assert kiem_luu_chieu("08/2013", "Quý III/2013") == "ĐÚNG" and kiem_luu_chieu("10/2013", "Quý III/2013").startswith(QD_SAI)
+    assert kiem_luu_chieu("01/2013", "09/2013") == "SAI - Excel 01/2013, file 09/2013"
+    assert kiem_luu_chieu("01/2013", "2013") == "ĐÚNG NĂM (file chỉ ghi năm)" and kiem_luu_chieu("01/2013", "") == "KHÔNG ĐỌC ĐƯỢC LƯU CHIỂU"
+    # Excel ghi tháng lưu chiểu (không phải ngày QĐXB): ĐÚNG THEO LƯU CHIỂU, không tự đổi tên
+    r = dict(nam="2013", dong="5", ten="X", qdxb="10/2013", tinh_trang="KHỚP", ten_moi="x_1013_R_PL_M00")
+    b, = bao_cao_qdxb([r], {0: ["a.pdf"]}, [], lambda p: dict(so="1", ngay="04/09/2013", luu_chieu="10/2013", noi="trang cuối"))
+    assert b["kiem"] == "ĐÚNG THEO LƯU CHIỂU (QĐXB file 04/09/2013)" and b["kiem_lc"] == "ĐÚNG" and ke_hoach_doi_qdxb([b], "x") == []
     tq = tempfile.mkdtemp(); dich = os.path.join(tq, "dich")
 
     def sach(nam, thang, ten, chu, duoi=".pdf", bia=False):
@@ -2592,6 +2648,7 @@ def _test_qdxb():
     b = by[("2013", "30")]
     assert b["kiem"] == "SAI - Excel 01/2013, file 04/09/2013" and b["ten_moi_qd"] == "so_tay_dang_vien_040913_R_04_M00"
     assert b["so"] == "3636-QD/NXBCTQG" and b["luu_chieu"] == "09/2013" and b["noi"] == "trang cuối" and "dòng 762" in b["ghi_chu"]
+    assert b["kiem_lc"] == "SAI - Excel 01/2013, file 09/2013"
     assert by[("2020", "5")]["kiem"] == QD_DUNG and by[("2020", "5")]["ngay"] == "15/05/2020"
     assert by[("2020", "6")]["kiem"] == QD_KHONG and by[("2020", "7")]["kiem"] == QD_CHUA and ("2020", "8") not in by
     assert bc[0]["kiem"].startswith(QD_SAI) and bc[-1]["kiem"] == QD_DUNG and bc[-2]["kiem"] != QD_DUNG
@@ -2606,10 +2663,11 @@ def _test_qdxb():
     ra1, ra2 = ghi_qdxb(bc, xl, os.path.join(tq, "ra"))
     ws = openpyxl.load_workbook(ra2)["2013"]
     assert ws.cell(1, 5).value == "Kiểm tra QĐXB" and ws.cell(30, 5).value.startswith("SAI") and ws.cell(30, 6).value == "04/09/2013"
-    assert ws.cell(30, 5).fill.fgColor.rgb == "00F4B183" and ws.cell(30, 9).value == "so_tay_dang_vien_040913_R_04_M00"
+    assert ws.cell(30, 5).fill.fgColor.rgb == "00F4B183" and ws.cell(30, 10).value == "so_tay_dang_vien_040913_R_04_M00"
+    assert ws.cell(1, 9).value == "Kiểm tra lưu chiểu" and ws.cell(30, 9).value.startswith("SAI") and ws.cell(30, 9).fill.fgColor.rgb == "00F4B183"
     _, ra3 = ghi_qdxb(bc, ra2, os.path.join(tq, "ra"))  # chạy lại trên bản đã đánh dấu: ghi đè đúng cột cũ
     ws = openpyxl.load_workbook(ra3)["2013"]
-    assert ws.max_column == 9 and ws.cell(1, 10).value is None and not os.path.basename(ra3).count("_qdxb_") > 1
+    assert ws.max_column == 10 and ws.cell(1, 11).value is None and not os.path.basename(ra3).count("_qdxb_") > 1
     assert openpyxl.load_workbook(ra1)["KIEM_TRA_QDXB"].max_row == len(bc) + 1
     # đổi tên theo QĐXB: chỉ dòng 30 (dòng 762 chép trùng cùng file, dòng 2014 khác năm -> để xem tay)
     kh = ke_hoach_doi_qdxb(bc, dich)
