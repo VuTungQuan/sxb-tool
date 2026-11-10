@@ -1279,8 +1279,9 @@ LC_RE = re.compile(r"nop\s*luu\s*chieu\s*:?\s*(?:thang\s*(\d{1,2})\s*(?:[-/.]|na
 COT_QD = [("nam", "Năm"), ("dong", "Dòng Excel"), ("ten", "Tên sách"), ("qdxb", "QĐXB Excel"), ("kiem", "Kiểm tra QĐXB"),
           ("ngay", "Ngày QĐXB (file)"), ("so", "Số QĐXB (file)"), ("luu_chieu", "Nộp lưu chiểu (file)"), ("noi", "Đọc ở"),
           ("ten_moi", "Tên file mới (hiện tại)"), ("ten_moi_qd", "Tên mới theo QĐXB file"), ("ghi_chu", "Ghi chú"),
-          ("file", "File đọc"), ("thu_muc", "Thư mục đích")]
+          ("file", "File đọc"), ("thu_muc", "Thư mục đích"), ("thu_muc_moi", "Thư mục sau đổi tên")]
 QD_DUNG, QD_SAI, QD_KHONG, QD_CHUA = "ĐÚNG", "SAI", "KHÔNG ĐỌC ĐƯỢC QĐXB", "KHÔNG THẤY Ở THƯ MỤC ĐÍCH"
+QD_DA_DOI = "ĐÃ ĐỔI TÊN"
 
 
 def doc_qdxb(text):
@@ -1428,8 +1429,8 @@ def ghi_qdxb(bc, xlsx_danh_dau, thu_muc_ra):
     from openpyxl.styles import Alignment, Font, PatternFill
     os.makedirs(thu_muc_ra, exist_ok=True)
     tem = dt.datetime.now().strftime("%Y%m%d_%H%M")
-    mau = lambda k: PatternFill("solid", fgColor="F4B183" if k.startswith(QD_SAI) else "D9D9D9") \
-        if k.startswith((QD_SAI, QD_KHONG)) else None
+    mau = lambda k: PatternFill("solid", fgColor="F4B183" if k.startswith(QD_SAI) else "C6EFCE" if k.startswith(QD_DA_DOI)
+                                else "D9D9D9") if k.startswith((QD_SAI, QD_KHONG, QD_DA_DOI)) else None
 
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "KIEM_TRA_QDXB"
     ws.append([h for _, h in COT_QD])
@@ -1437,7 +1438,7 @@ def ghi_qdxb(bc, xlsx_danh_dau, thu_muc_ra):
         ws.append([_cell(b.get(k, "")) for k, _ in COT_QD])
         if mau(b["kiem"]):
             ws.cell(ws.max_row, 5).fill = mau(b["kiem"])
-    for c, w in zip("ABCDEFGHIJKLMN", (6, 8, 50, 11, 40, 13, 22, 13, 11, 45, 45, 30, 60, 60)):
+    for c, w in zip("ABCDEFGHIJKLMNO", (6, 8, 50, 11, 40, 13, 22, 13, 11, 45, 45, 30, 60, 60, 60)):
         ws.column_dimensions[c].width = w
     for c in ws[1]:
         c.font = Font(bold=True)
@@ -1460,9 +1461,14 @@ def ghi_qdxb(bc, xlsx_danh_dau, thu_muc_ra):
         c0 = tieu_de.index(them[0]) + 1 if them[0] in tieu_de else ws.max_column + 1
         for j, h in enumerate(them):
             ws.cell(hd, c0 + j, h).font = Font(bold=True)
+        cot_dich = tieu_de.index("Đường dẫn đích") + 1 if "Đường dẫn đích" in tieu_de else 0
+        cot_ten = tieu_de.index("Tên file mới") + 1 if "Tên file mới" in tieu_de else 0
         for b in bs:
             for j, k in enumerate(("kiem", "ngay", "so", "luu_chieu", "ten_moi_qd")):
                 ws.cell(int(b["dong"]), c0 + j, b.get(k, "") or None)
+            if b.get("thu_muc_moi"):  # đã đổi tên: cột của bước đổi tên & lưu theo tên, đường dẫn mới
+                cot_dich and ws.cell(int(b["dong"]), cot_dich, _cell(b["dich_moi"]))
+                cot_ten and ws.cell(int(b["dong"]), cot_ten, b["ten_moi_qd"])
             ws.cell(int(b["dong"]), c0).fill = mau(b["kiem"]) or PatternFill()
             ws.cell(int(b["dong"]), c0).alignment = Alignment(wrap_text=True)
         ws.column_dimensions[openpyxl.utils.get_column_letter(c0)].width = 40
@@ -1470,6 +1476,97 @@ def ghi_qdxb(bc, xlsx_danh_dau, thu_muc_ra):
     ra2 = os.path.join(thu_muc_ra, f"{ten}_qdxb_{tem}.xlsx")
     wb.save(ra2)
     return ra1, ra2
+
+
+def ke_hoach_doi_qdxb(bc, thu_muc_dich):
+    """Dòng SAI -> [(b, thư mục sách cũ, thư mục mới, [(file cũ, file mới)])]: thư mục sách chuyển sang
+    <Năm>/thang <tháng QĐXB trên file>/<Tên mới theo QĐXB file>, trùng tên thì _2, _3; file ruột đổi phần tên thư mục cũ,
+    file bìa đổi phần tên bìa cũ (_B_) sang tên mới; file khác giữ tên. Không đổi (ghi lý do vào Ghi chú, để xem tay):
+    năm QĐXB khác năm Excel (thường là khớp nhầm sách); nhiều dòng cùng QĐXB (chép trùng một file: chỉ đổi dòng đầu, có
+    dòng ĐÚNG cùng QĐXB thì không đổi dòng nào); thư mục không có dạng <Năm>/thang MM/<tên>."""
+    nhom = defaultdict(list)
+    for b in bc:
+        if b.get("ngay"):
+            nhom[(b["so"], b["ngay"])].append(b)
+    kh, da_dung = [], set()
+    for b in bc:
+        if not b["kiem"].startswith(QD_SAI):
+            continue
+        cung, phan = nhom[(b["so"], b["ngay"])], os.path.relpath(b["thu_muc"], thu_muc_dich).split(os.sep)
+        bo = ("không lập được tên mới (Tên file mới không có _R_)" if not b.get("ten_moi_qd") else
+              "năm QĐXB khác năm Excel" if b["ngay"][-4:] != str(b["nam"]) else
+              "trùng QĐXB với dòng khác" if any(x["kiem"] == QD_DUNG for x in cung) or
+              next(x for x in cung if x["kiem"].startswith(QD_SAI)) is not b else
+              "thư mục không có dạng Năm/thang MM/<tên>" if len(phan) != 3 or not re.fullmatch(r"(?:19|20)\d\d", phan[0]) else "")
+        if bo:
+            b["ghi_chu"] = "; ".join(x for x in (b["ghi_chu"], f"không đổi tên: {bo} - xem tay") if x)
+            continue
+        goc = os.path.join(thu_muc_dich, phan[0], f"thang {b['ngay'][3:5]}", b["ten_moi_qd"])
+        moi, i = goc, 1
+        while moi.lower() in da_dung or os.path.exists(duong_dan_dai(moi)):
+            i += 1
+            moi = f"{goc}_{i}"
+        da_dung.add(moi.lower())
+        cap = ((os.path.basename(b["thu_muc"]), os.path.basename(moi)), (ten_bia(b["ten_moi"]), ten_bia(b["ten_moi_qd"])))
+        doi = []
+        for root, _, files in os.walk(duong_dan_dai(b["thu_muc"])):
+            rel = os.path.relpath(root.replace("\\\\?\\", "", 1), b["thu_muc"])
+            for fn in sorted(files):
+                fn2 = next((z + fn[len(a):] for a, z in cap if fn.startswith(a)), fn)
+                doi.append((os.path.normpath(os.path.join(b["thu_muc"], rel, fn)), os.path.normpath(os.path.join(moi, rel, fn2))))
+        kh.append((b, b["thu_muc"], moi, doi))
+    return kh
+
+
+def doi_ten_qdxb(kh, progress=None):
+    """Thực hiện kế hoạch: chuyển thư mục sách (đổi tên trên cùng ổ, không chép lại), đổi tên file bên trong, xoá thư mục
+    tháng cũ nếu rỗng. Ghi b['kiem'] = ĐÃ ĐỔI TÊN, b['thu_muc_moi'], b['dich_moi']; lỗi ghi vào Ghi chú rồi làm tiếp.
+    -> (số sách đã đổi, [lỗi])."""
+    xong, loi = 0, []
+    for j, (b, cu, moi, doi) in enumerate(kh, 1):
+        if DUNG.is_set():
+            break
+        try:
+            os.makedirs(duong_dan_dai(os.path.dirname(moi)), exist_ok=True)
+            os.rename(duong_dan_dai(cu), duong_dan_dai(moi))
+            b["thu_muc_moi"], b["dich_moi"] = moi, "\n".join(z for _, z in doi)
+            for a, z in doi:
+                a = os.path.join(moi, os.path.relpath(a, cu))
+                if a != z:
+                    os.rename(duong_dan_dai(a), duong_dan_dai(z))
+            b["kiem"] = f"{QD_DA_DOI} theo QĐXB file {b['ngay']} (Excel {b['qdxb']})"
+            xong += 1
+            try:
+                os.rmdir(duong_dan_dai(os.path.dirname(cu)))  # thư mục tháng cũ: chỉ xoá được khi đã rỗng
+            except OSError:
+                pass
+        except OSError as e:
+            loi.append(f"{cu}: {e}")
+            b["ghi_chu"] = "; ".join(x for x in (b["ghi_chu"], f"LỖI đổi tên: {e.strerror or e}") if x)
+        if progress:
+            progress(j, len(kh))
+    return xong, loi
+
+
+def sua_doi_chieu(dc, bc, thu_muc_ra):
+    """Bản sao file doi_chieu, các dòng đã đổi tên nhận QĐXB, Tên file mới, Đường dẫn đích mới: chạy lại Đổi tên & lưu
+    không chép lại vào chỗ cũ, chạy lại Kiểm tra QĐXB vẫn gắn được thư mục mới. -> đường dẫn file mới."""
+    import openpyxl
+    sua = {(str(b["nam"]), str(b["dong"])): b for b in bc if b.get("thu_muc_moi")}
+    wb = openpyxl.load_workbook(dc)
+    for ws in (wb[n] for n in ("KHOP", "CAN_XU_LY") if n in wb.sheetnames):
+        cot = {c.value: c.column - 1 for c in ws[1]}
+        for row in ws.iter_rows(min_row=2):
+            b = sua.get((str(row[cot["Năm"]].value), str(row[cot["Dòng Excel"]].value)))
+            if b:
+                gc = f"QĐXB theo file (Excel {b['qdxb']})"
+                for h, v in (("QĐXB", b["ngay"]), ("Tên file mới", b["ten_moi_qd"]), ("Đường dẫn đích", _cell(b["dich_moi"])),
+                             ("Ghi chú", "; ".join(x for x in (row[cot["Ghi chú"]].value, gc) if x))):
+                    if h in cot:  # file đối chiếu cũ có thể thiếu cột Đường dẫn đích
+                        row[cot[h]].value = v
+    ra = os.path.join(thu_muc_ra, f"doi_chieu_{dt.datetime.now():%Y%m%d_%H%M%S}.xlsx")
+    wb.save(ra)
+    return ra
 
 
 def moi_nhat(*mau):
@@ -1913,11 +2010,14 @@ def gui(so_tab=2):
     hang(t5, 2, "Excel cần đánh dấu", v_xl5, chon_xlsx)
     hang(t5, 3, "Thư mục kết quả", v_ra5, filedialog.askdirectory)
     ttk.Label(t5, text="Đọc 'Quyết định xuất bản số ..., ngày ...' ở trang cuối từng sách trong thư mục đích, so với cột QĐXB "
-                       "của Excel.\nExcel cần đánh dấu: nên chọn bản *_danh_dau_* mới nhất để giữ các cột đánh dấu cũ.",
+                       "của Excel.\nExcel cần đánh dấu: nên chọn bản *_danh_dau_* mới nhất để giữ các cột đánh dấu cũ.\n"
+                       "Đổi tên theo QĐXB: sách SAI được chuyển sang đúng thư mục tháng QĐXB, đổi tên file ruột và bìa.",
               justify="left").grid(row=4, column=0, columnspan=3, sticky="w", pady=4)
     pb5, lb5, tt5 = khung(t5, 6)
+    loai = lambda k: next((x for x in (QD_DA_DOI, QD_SAI, QD_KHONG) if k.startswith(x)), k)
 
-    def kiem_qd():
+    def kiem_qd(che_do="danh_dau"):
+        """che_do: 'danh_dau' (chỉ đánh dấu) | 'thu' (liệt kê sẽ đổi tên gì, không đổi) | 'doi' (đổi tên rồi đánh dấu)."""
         dich, dc, xl = v_dich.get(), v_dc5.get(), v_xl5.get()
         if not os.path.isdir(dich): raise ValueError("Chưa chọn thư mục đích")
         if not os.path.isfile(dc): raise ValueError("Chưa chọn file doi_chieu")
@@ -1945,16 +2045,46 @@ def gui(so_tab=2):
             cache.dong(); dong_word()
         if DUNG.is_set():
             log("ĐÃ DỪNG - file chưa đọc ghi là không đọc được; chạy lại sẽ lấy phần đã đọc từ cache, làm tiếp.")
+            if che_do == "doi":
+                raise DaDung("Đã dừng khi đang đọc QĐXB - chưa đổi tên thư mục nào. Chạy lại sẽ đọc tiếp từ cache.")
         DUNG.clear()
-        dem = Counter(b["kiem"].split(" - ")[0].split(" (")[0] for b in bc)
-        log("Kết quả: " + ", ".join(f"{k}: {v}" for k, v in dem.most_common()))
+        log("Kết quả: " + ", ".join(f"{k}: {v}" for k, v in Counter(loai(b["kiem"]) for b in bc).most_common()))
         for b in [b for b in bc if b["kiem"].startswith(QD_SAI)][:20]:
             log(f"  {b['nam']} dòng {b['dong']} - {b['ten'][:60]}: {b['kiem']}" + (f" ({b['ghi_chu']})" if b["ghi_chu"] else ""))
+        if che_do != "danh_dau":
+            kh = ke_hoach_doi_qdxb(bc, dich)
+            bo = [b for b in bc if "không đổi tên:" in b.get("ghi_chu", "")]
+            log(f"\nĐổi tên theo QĐXB: {len(kh)} sách sẽ chuyển thư mục và đổi tên, {len(bo)} sách SAI để xem tay:")
+            for b in bo:
+                log(f"  BỎ QUA {b['nam']} dòng {b['dong']} - {b['ten'][:60]}: {b['ghi_chu'].split('không đổi tên: ')[-1]}")
+            if che_do == "thu":
+                for b, cu, moi, doi in kh:
+                    log(f"{cu}\n   → {moi}" + "".join(f"\n      {os.path.basename(a)} → {os.path.basename(z)}"
+                                                      for a, z in doi if os.path.basename(a) != os.path.basename(z)))
+                het(f"Chạy thử xong - {len(kh)} sách sẽ đổi tên, chưa đổi gì")
+                return
+            if kh and not hoi(f"Chuyển và đổi tên {len(kh)} thư mục sách trong\n{dich}\ntheo ngày QĐXB đọc ở trang cuối?\n\n"
+                              "Tool không tự hoàn tác. Nên bấm 'Chạy thử đổi tên' và xem danh sách trước."):
+                raise DaDung("Chưa đổi tên - đã huỷ.")
+            xong, loi = doi_ten_qdxb(kh, lambda j, n: bao("Đổi tên theo QĐXB", j, n))
+            log(f"Đã đổi tên {xong}/{len(kh)} sách, {len(loi)} lỗi." + "".join(f"\n  LỖI {x}" for x in loi[:50]))
+            if xong:
+                bao("Ghi file đối chiếu mới (QĐXB, tên, đường dẫn mới)")
+                dc2 = sua_doi_chieu(dc, bc, TM["3_doi_ten"])
+                ui(v_dc5.set, dc2); ui(v_dc4.set, dc2)
+                log(f"File đối chiếu mới (dùng file này khi chạy lại Đổi tên & lưu hoặc Kiểm tra QĐXB): {dc2}")
         bao("Ghi file kết quả")
         ra1, ra2 = ghi_qdxb(bc, xl, v_ra5.get() or TM["4_kiem_tra_qdxb"])
-        log(f"Báo cáo: {ra1}\nExcel đánh dấu thêm cột 'Kiểm tra QĐXB' (SAI tô cam): {ra2}")
-        het(f"Xong - {dem[QD_SAI]} sách SAI QĐXB - tổng thời gian {_gio(time.time() - T0)}")
-    b5 = ttk.Button(t5, text="Quét & đánh dấu", command=lambda: chay(b5, bat(pb5, kiem_qd), tt5)); b5.grid(row=5, column=1, sticky="w", pady=6)
+        ui(v_xl5.set, ra2)
+        log(f"Báo cáo: {ra1}\nExcel đánh dấu thêm cột 'Kiểm tra QĐXB' (SAI tô cam, đã đổi tên tô xanh): {ra2}")
+        dem = Counter(loai(b["kiem"]) for b in bc)
+        het(f"Xong - {dem[QD_SAI]} sách SAI QĐXB, {dem[QD_DA_DOI]} sách đã đổi tên - tổng thời gian {_gio(time.time() - T0)}")
+    nut5 = ttk.Frame(t5); nut5.grid(row=5, column=1, sticky="w", pady=6)
+    b5 = ttk.Button(nut5, text="Quét & đánh dấu", command=lambda: chay(b5, bat(pb5, kiem_qd), tt5)); b5.pack(side="left")
+    b5t = ttk.Button(nut5, text="Chạy thử đổi tên", command=lambda: chay(b5t, bat(pb5, lambda: kiem_qd("thu")), tt5))
+    b5t.pack(side="left", padx=8)
+    b5d = ttk.Button(nut5, text="Đổi tên theo QĐXB", command=lambda: chay(b5d, bat(pb5, lambda: kiem_qd("doi")), tt5))
+    b5d.pack(side="left")
 
     root.mainloop()
 
@@ -2443,17 +2573,20 @@ def _test_qdxb():
     p3 = sach("2020", "05", "luat_dat_dai_0520_R_PL_T01", "Quyết định xuất bản số 12/QĐ-NXBCTQG ngày 15 tháng 5 năm 2020", ".docx")
     p4 = sach("2020", "05", "luat_dat_dai_0520_R_PL_T01_2", "không có thông tin xuất bản")
     p5 = sach("2020", "06", "sach_la_0620_R_PL_M00", QD)
+    p6 = sach("2014", "03", "sach_nham_0314_R_PL_M00", QD)  # QĐXB năm 2013 trong sách năm 2014: không tự đổi tên
+    open(os.path.join(os.path.dirname(p1), "Bia", "so_tay_dang_vien_0113_B_04_M00.jpg"), "wb").write(b"anh bia")
     k = dict(tinh_trang="KHỚP", dich="", bbt="KĐLL", lan="")
     kq = [dict(k, nam="2013", dong="30", ten="Sổ tay đảng viên", qdxb="01/2013", ten_moi="so_tay_dang_vien_0113_R_04_M00"),
-          dict(k, nam="2013", dong="762", ten="Sổ tay đảng viên", qdxb="12/2013", ten_moi="x", dich=p2),  # gắn theo Đường dẫn đích
+          dict(k, nam="2013", dong="762", ten="Sổ tay đảng viên", qdxb="12/2013", ten_moi="so_tay_1213_R_04_M00", dich=p2),  # gắn theo Đường dẫn đích
           dict(k, nam=2020, dong=5, ten="Luật đất đai", qdxb="05/2020", ten_moi="luat_dat_dai_0520_R_PL_T01"),
           dict(k, nam=2020, dong=6, ten="Luật đất đai", qdxb="05/2020", ten_moi="luat_dat_dai_0520_R_PL_T01"),  # thư mục _2
           dict(k, nam=2020, dong=7, ten="Chưa chép", qdxb="07/2020", ten_moi="chua_chep_0720_R_PL_M00"),
-          dict(k, nam=2020, dong=8, ten="Không tìm được", qdxb="", ten_moi="y", tinh_trang="KHÔNG TÌM ĐƯỢC")]
+          dict(k, nam=2020, dong=8, ten="Không tìm được", qdxb="", ten_moi="y", tinh_trang="KHÔNG TÌM ĐƯỢC"),
+          dict(k, nam="2014", dong="9", ten="Sách nhầm", qdxb="03/2014", ten_moi="sach_nham_0314_R_PL_M00")]
     theo_dong, la = quet_dich(dich, kq)
-    assert dict(theo_dong) == {0: [p1], 1: [p2], 2: [p3], 3: [p4]} and la == [p5]
+    assert dict(theo_dong) == {0: [p1], 1: [p2], 2: [p3], 3: [p4], 6: [p6]} and la == [p5]
     cq = Cache(os.path.join(tq, "qd.sqlite"))
-    assert doc_truoc(cq, [p1, p2, p3, p4], 2, ham=trich_qdxb) == 4
+    assert doc_truoc(cq, [p1, p2, p3, p4, p6], 2, ham=trich_qdxb) == 5
     bc = bao_cao_qdxb(kq, theo_dong, la, lambda p: qdxb_cache(cq, p)); cq.dong()
     by = {(str(b["nam"]), str(b["dong"])): b for b in bc}
     b = by[("2013", "30")]
@@ -2478,6 +2611,36 @@ def _test_qdxb():
     ws = openpyxl.load_workbook(ra3)["2013"]
     assert ws.max_column == 9 and ws.cell(1, 10).value is None and not os.path.basename(ra3).count("_qdxb_") > 1
     assert openpyxl.load_workbook(ra1)["KIEM_TRA_QDXB"].max_row == len(bc) + 1
+    # đổi tên theo QĐXB: chỉ dòng 30 (dòng 762 chép trùng cùng file, dòng 2014 khác năm -> để xem tay)
+    kh = ke_hoach_doi_qdxb(bc, dich)
+    assert [str(x[0]["dong"]) for x in kh] == ["30"]
+    assert "trùng QĐXB" in by[("2013", "762")]["ghi_chu"] and "năm QĐXB khác năm Excel" in by[("2014", "9")]["ghi_chu"]
+    _, cu, moi, doi = kh[0]
+    assert moi == os.path.join(dich, "2013", "thang 09", "so_tay_dang_vien_040913_R_04_M00")
+    assert sorted(os.path.relpath(z, moi) for _, z in doi) == sorted(["so_tay_dang_vien_040913_R_04_M00.pdf",
+        os.path.join("Bia", "bia.pdf"), os.path.join("Bia", "so_tay_dang_vien_040913_B_04_M00.jpg")])
+    assert doi_ten_qdxb(kh) == (1, []) and all(os.path.isfile(z) for _, z in doi)
+    assert not os.path.exists(cu) and not os.path.exists(os.path.dirname(cu))  # thư mục tháng cũ rỗng đã xoá
+    assert by[("2013", "30")]["kiem"] == "ĐÃ ĐỔI TÊN theo QĐXB file 04/09/2013 (Excel 01/2013)"
+    dcp = os.path.join(tq, "doi_chieu_cu.xlsx")
+    wb = openpyxl.Workbook(); wb.active.title = "KHOP"; wb.active.append([h for _, h in COT_KQ])
+    for r in kq:
+        wb.active.append([int(r[c]) if c in ("nam", "dong") else _cell(r.get(c, "")) for c, _ in COT_KQ])
+    wb.save(dcp)
+    kq2 = doc_doi_chieu(sua_doi_chieu(dcp, bc, tq))
+    r30 = next(r for r in kq2 if str(r["dong"]) == "30")
+    assert (r30["qdxb"], r30["ten_moi"]) == ("04/09/2013", "so_tay_dang_vien_040913_R_04_M00") and moi in r30["dich"]
+    assert "QĐXB theo file (Excel 01/2013)" in r30["ghi_chu"] and next(r for r in kq2 if str(r["dong"]) == "762")["qdxb"] == "12/2013"
+    td2, la2 = quet_dich(dich, kq2)  # quét lại sau đổi tên: thư mục mới vẫn gắn đúng dòng, giờ ra ĐÚNG
+    assert td2[kq2.index(r30)] == [os.path.join(moi, "so_tay_dang_vien_040913_R_04_M00.pdf")] and la2 == [p5]
+    cq = Cache(os.path.join(tq, "qd.sqlite"))
+    bc2 = bao_cao_qdxb(kq2, td2, la2, lambda p: qdxb_cache(cq, p)); cq.dong()
+    assert next(b for b in bc2 if str(b["dong"]) == "30")["kiem"] == QD_DUNG
+    xl2 = os.path.join(tq, "co_cot_dich.xlsx")
+    wb = openpyxl.Workbook(); wb.active.title = "2013"; wb.active.append(["TT", "Tên sách", "QĐXB", "Tên file mới", "Đường dẫn đích"]); wb.save(xl2)
+    ws = openpyxl.load_workbook(ghi_qdxb(bc, xl2, os.path.join(tq, "ra"))[1])["2013"]
+    assert ws.cell(30, 4).value == "so_tay_dang_vien_040913_R_04_M00" and moi in ws.cell(30, 5).value
+    assert ws.cell(30, 6).value.startswith("ĐÃ ĐỔI TÊN") and ws.cell(30, 6).fill.fgColor.rgb == "00C6EFCE"
     shutil.rmtree(tq, ignore_errors=True)
     print("OK")
 
