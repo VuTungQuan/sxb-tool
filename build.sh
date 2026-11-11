@@ -23,10 +23,18 @@ PY="${PYTHON:-python3}"
 "$PY" -c 'import tkinter' || { echo "[LỖI] Python này thiếu tkinter: sudo apt install python3-tk"; exit 1; }
 
 # 2. Môi trường riêng + thư viện (pymupdf ghim dưới 2.0 như bản Windows)
-[ -x .venv-linux/bin/python ] || "$PY" -m venv .venv-linux
 V=.venv-linux/bin/python
+# môi trường tạo dở (vd lần trước máy chưa có python3-venv: có python nhưng không có pip) -> xoá, tạo lại
+if [ -d .venv-linux ] && ! "$V" -m pip --version >/dev/null 2>&1; then
+    echo "Môi trường .venv-linux bị hỏng (thiếu pip) - tạo lại"; rm -rf .venv-linux
+fi
+[ -x "$V" ] || "$PY" -m venv .venv-linux
 "$V" -m pip install -q --disable-pip-version-check --upgrade pip
 "$V" -m pip install -q --disable-pip-version-check openpyxl "pymupdf>=1.24.3,<2" python-docx pyinstaller
+"$V" -c 'import openpyxl, fitz, docx, PyInstaller' 2>/dev/null || {
+    echo "[LỖI] Cài thư viện chưa đủ (openpyxl, pymupdf, python-docx, pyinstaller) vào .venv-linux."
+    echo "      Thường do máy không tải được từ PyPI: thử 'ping pypi.org', hoặc chép sẵn file dist-linux/SXBTool đã build ở máy khác."
+    exit 1; }
 "$V" -c 'import sys, fitz; print("Python", sys.version.split()[0], "- PyMuPDF", fitz.VersionBind)'
 
 # 3. Tự kiểm tra trước khi build
