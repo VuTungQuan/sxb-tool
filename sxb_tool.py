@@ -627,9 +627,14 @@ def ghi_ket_qua(kq, xlsx_goc, thu_muc_ra, thu_muc=(), can_ocr=()):
     return ra1, ra2
 
 
+KY_TU_CAM = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")  # openpyxl từ chối ghi: ký tự điều khiển (vd ô bảng Word .doc kết thúc bằng \x07)
+
+
 def _cell(v):
     if isinstance(v, (dt.datetime, dt.date)):
         return v.strftime("%d/%m/%Y")
+    if isinstance(v, str):
+        v = KY_TU_CAM.sub(" ", v)
     if isinstance(v, str) and len(v) > GIOI_HAN_O:  # Excel báo lỗi file nếu ô dài hơn 32.767 ký tự
         giu = v[:GIOI_HAN_O].split("\n")[:-1]
         bo = v.count("\n") + 1 - len(giu)
@@ -1545,7 +1550,7 @@ def ghi_qdxb(bc, xlsx_danh_dau, thu_muc_ra):
         cot_ten = tieu_de.index("Tên file mới") + 1 if "Tên file mới" in tieu_de else 0
         for b in bs:
             for j, k in enumerate(("kiem", "ngay", "so", "luu_chieu", "kiem_lc", "ten_moi_qd")):
-                ws.cell(int(b["dong"]), c0 + j, b.get(k, "") or None)
+                ws.cell(int(b["dong"]), c0 + j, _cell(b.get(k, "")) or None)
             ws.cell(int(b["dong"]), c0 + 4).fill = mau(b.get("kiem_lc", "")) or PatternFill()
             if b.get("thu_muc_moi"):  # đã đổi tên: cột của bước đổi tên & lưu theo tên, đường dẫn mới
                 cot_dich and ws.cell(int(b["dong"]), cot_dich, _cell(b["dich_moi"]))
@@ -2711,6 +2716,8 @@ def _test_qdxb():
     assert kiem_qdxb(dict(qdxb="04/09/2013", ten_moi="a_040913_R_PL_M00"), dict(ngay="04/09/2013"))[0] == QD_DUNG
     assert kiem_qdxb(dict(qdxb="05/09/2013", ten_moi="a_R_PL_M00"), dict(ngay="04/09/2013")) == \
         ("SAI - Excel 05/09/2013, file 04/09/2013", "a_040913_R_PL_M00")
+    assert _cell("Cao\x07Trung bình\x13") == "Cao Trung bình " and _cell("a\tb\nc") == "a\tb\nc"
+    bc[0]["mau"] = "ại, tổn hại: Cao\x07Trung bình\x13 HYPERLINK\x14"  # chữ cuối file .doc có bảng: openpyxl từ chối nếu không lọc
     xl = os.path.join(tq, "tong_hop_danh_dau_1.xlsx")
     wb = openpyxl.Workbook(); wb.active.title = "2013"; wb.create_sheet("2020")
     for ws in wb.worksheets:
